@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -34,6 +35,7 @@ type WebSocketClient struct {
 	subscriptions map[string]struct{} // Tracks subscribed streams
 	workerCount   int                 // Number of worker goroutines
 	clientID      string              // Identifier (e.g., "spot", "futures")
+	isFutures     bool                // Whether this is a futures client
 }
 
 // Message wraps a WebSocket message with metadata.
@@ -61,7 +63,6 @@ func NewWebSocketManager() *WebSocketManager {
 func (m *WebSocketManager) AddClient(clientID, url string, handler func(Message), workerCount int) *WebSocketClient {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	client := NewWebSocketClient(clientID, url, handler, workerCount)
 	m.clients[clientID] = client
 	return client
@@ -71,7 +72,6 @@ func (m *WebSocketManager) AddClient(clientID, url string, handler func(Message)
 func (m *WebSocketManager) StartAll() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	for _, client := range m.clients {
 		if err := client.Start(); err != nil {
 			return fmt.Errorf("failed to start client %s: %v", client.clientID, err)
@@ -84,7 +84,6 @@ func (m *WebSocketManager) StartAll() error {
 func (m *WebSocketManager) ShutdownAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	for _, client := range m.clients {
 		client.Shutdown()
 	}
@@ -95,19 +94,21 @@ func (m *WebSocketManager) ShutdownAll() {
 // NewWebSocketClient creates a new WebSocket client.
 func NewWebSocketClient(clientID, url string, handler func(Message), workerCount int) *WebSocketClient {
 	ctx, cancel := context.WithCancel(context.Background())
+	isFutures := strings.Contains(url, "fapi")
 	return &WebSocketClient{
 		clientID:      clientID,
 		url:           url,
-		messageChan:   make(chan Message, 2000), // Increased buffer for multiple streams
+		messageChan:   make(chan Message, 2000), // Increased buffer
 		handler:       handler,
 		reconnect:     true,
-		reconnectWait: 2 * time.Second, // Increased initial wait
+		reconnectWait: 2 * time.Second,
 		maxWait:       30 * time.Second,
 		ctx:           ctx,
 		cancel:        cancel,
 		isConnected:   false,
 		subscriptions: make(map[string]struct{}),
 		workerCount:   workerCount,
+		isFutures:     isFutures,
 	}
 }
 
@@ -122,16 +123,13 @@ func (c *WebSocketClient) Start() error {
 func (c *WebSocketClient) Subscribe(streams ...string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	for _, stream := range streams {
-		// Validate stream format (e.g., "btcusdt@trade")
 		if !strings.Contains(stream, "@") || len(strings.Split(stream, "@")) != 2 {
 			return fmt.Errorf("invalid stream format: %s", stream)
 		}
 		c.subscriptions[strings.ToLower(stream)] = struct{}{}
 	}
 	log.Printf("[%s] Subscribed to streams: %v", c.clientID, streams)
-
 	if c.isConnected && c.conn != nil {
 		return c.sendSubscription()
 	}
@@ -142,12 +140,10 @@ func (c *WebSocketClient) Subscribe(streams ...string) error {
 func (c *WebSocketClient) Unsubscribe(streams ...string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	for _, stream := range streams {
 		delete(c.subscriptions, strings.ToLower(stream))
 	}
 	log.Printf("[%s] Unsubscribed from streams: %v", c.clientID, streams)
-
 	if c.isConnected && c.conn != nil {
 		return c.sendSubscription()
 	}
@@ -159,18 +155,33 @@ func (c *WebSocketClient) sendSubscription() error {
 	if len(c.subscriptions) == 0 {
 		return nil
 	}
-
 	streams := make([]string, 0, len(c.subscriptions))
 	for stream := range c.subscriptions {
 		streams = append(streams, stream)
 	}
 	log.Printf("[%s] Sending subscription for streams: %v", c.clientID, streams)
 
-	subMsg := map[string]interface{}{
-		"method": "SUBSCRIBE",
-		"params": streams,
-		"id":     rand.Intn(1000),
+	var subMsg map[string]interface{}
+
+	if c.isFutures {
+		// Futures API uses different format
+		subMsg = map[string]interface{}{
+			"method": "SUBSCRIBE",
+			"params": streams,
+			"id":     rand.Intn(1000),
+		}
+	} else {
+		// Spot API
+		subMsg = map[string]interface{}{
+			"method": "SUBSCRIBE",
+			"params": streams,
+			"id":     rand.Intn(1000),
+		}
 	}
+
+	// Log the exact subscription message
+	msgBytes, _ := json.Marshal(subMsg)
+	log.Printf("[%s] Subscription message: %s", c.clientID, string(msgBytes))
 	return c.conn.WriteJSON(subMsg)
 }
 
@@ -194,7 +205,10 @@ func (c *WebSocketClient) run() {
 
 // lookupHostWithRetry attempts DNS resolution with retries and fallback resolvers.
 func lookupHostWithRetry(host string, retries int, timeout time.Duration) ([]string, error) {
-	resolvers := []string{"8.8.8.8:53", "1.1.1.1:53"} // Google and Cloudflare DNS
+	if strings.Contains(host, ":") {
+		host = strings.Split(host, ":")[0]
+	}
+	resolvers := []string{"8.8.8.8:53", "1.1.1.1:53"}
 	resolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -202,7 +216,6 @@ func lookupHostWithRetry(host string, retries int, timeout time.Duration) ([]str
 			return d.DialContext(ctx, network, address)
 		},
 	}
-
 	for attempt := 0; attempt < retries; attempt++ {
 		for _, addr := range resolvers {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -215,19 +228,16 @@ func lookupHostWithRetry(host string, retries int, timeout time.Duration) ([]str
 			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 		}
 	}
-	return nil, fmt.Errorf("DNS lookup failed after %d retries", retries)
+	return nil, fmt.Errorf("DNS lookup failed after %d retries for %s", retries, host)
 }
 
 // connect establishes a WebSocket connection and subscribes to streams.
 func (c *WebSocketClient) connect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	if c.isConnected {
 		return nil
 	}
-
-	// Retry DNS lookup with fallback resolvers
 	host := strings.Split(strings.TrimPrefix(c.url, "wss://"), "/")[0]
 	addrs, err := lookupHostWithRetry(host, 3, 2*time.Second)
 	if err != nil {
@@ -236,42 +246,42 @@ func (c *WebSocketClient) connect() error {
 	}
 	log.Printf("[%s] Resolved IPs for %s: %v", c.clientID, host, addrs)
 
-	// Build URL with combined streams
-	streams := make([]string, 0, len(c.subscriptions))
-	for stream := range c.subscriptions {
-		streams = append(streams, stream)
+	// Use combined stream URL for better performance
+	var url string
+	if c.isFutures {
+		url = "wss://fstream.binance.com/ws"
+	} else {
+		url = "wss://stream.binance.com:9443/ws"
 	}
-	url := c.url
-	if len(streams) > 0 {
-		url = fmt.Sprintf("%s/stream?streams=%s", c.url, strings.Join(streams, "/"))
-	}
-	log.Printf("[%s] Connecting to URL: %s", c.clientID, url)
 
+	log.Printf("[%s] Connecting to URL: %s", c.clientID, url)
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 30 * time.Second,
 	}
-	conn, _, err := dialer.DialContext(c.ctx, url, nil)
+	conn, resp, err := dialer.DialContext(c.ctx, url, nil)
 	if err != nil {
-		log.Printf("[%s] Connection failed: %v", c.clientID, err)
+		if resp != nil {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("[%s] Handshake failed with status: %v, response: %s", c.clientID, resp.Status, string(body))
+			resp.Body.Close()
+		} else {
+			log.Printf("[%s] Connection failed: %v", c.clientID, err)
+		}
 		return err
 	}
-
 	c.conn = conn
 	c.isConnected = true
 	log.Printf("[%s] Connected to %s", c.clientID, url)
 
 	c.wg.Add(1)
 	go c.readMessages()
-
 	c.wg.Add(1)
 	go c.handlePingPong()
-
 	c.startWorkers()
 
-	if len(streams) > 0 && !strings.Contains(c.url, "/stream") {
+	if len(c.subscriptions) > 0 {
 		return c.sendSubscription()
 	}
-
 	return nil
 }
 
@@ -279,7 +289,6 @@ func (c *WebSocketClient) connect() error {
 func (c *WebSocketClient) disconnect() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	if c.conn != nil {
 		if err := c.conn.Close(); err != nil {
 			log.Printf("[%s] Error closing connection: %v", c.clientID, err)
@@ -299,7 +308,12 @@ func (c *WebSocketClient) reconnectWithBackoff() {
 		case <-c.ctx.Done():
 			return
 		default:
-			if err := c.connect(); err == nil {
+			if err := c.connect(); err != nil {
+				if strings.Contains(err.Error(), "close 1008") {
+					log.Printf("[%s] Policy violation detected, waiting 5 minutes before retry", c.clientID)
+					time.Sleep(5 * time.Minute)
+				}
+			} else {
 				attempts = 0
 				return
 			}
@@ -333,8 +347,8 @@ func (c *WebSocketClient) readMessages() {
 			c.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 			_, message, err := c.conn.ReadMessage()
 			if err != nil {
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					log.Printf("[%s] WebSocket closed normally: %v", c.clientID, err)
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.ClosePolicyViolation) {
+					log.Printf("[%s] WebSocket closed: %v", c.clientID, err)
 				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					log.Printf("[%s] Read timeout: %v", c.clientID, err)
 				} else {
@@ -344,12 +358,76 @@ func (c *WebSocketClient) readMessages() {
 				return
 			}
 			c.conn.SetReadDeadline(time.Time{})
+
+			// Parse the message to extract stream info
+			msg := c.parseMessage(message)
+
 			select {
-			case c.messageChan <- Message{ClientID: c.clientID, Stream: "", Data: message}:
+			case c.messageChan <- msg:
 			default:
 				log.Printf("[%s] Message channel full, dropping message", c.clientID)
 			}
 		}
+	}
+}
+
+// parseMessage parses incoming messages and extracts stream information
+func (c *WebSocketClient) parseMessage(data []byte) Message {
+	// First, try to parse as a combined stream message
+	var combinedMsg struct {
+		Stream string          `json:"stream"`
+		Data   json.RawMessage `json:"data"`
+	}
+
+	if err := json.Unmarshal(data, &combinedMsg); err == nil && combinedMsg.Stream != "" {
+		return Message{
+			ClientID: c.clientID,
+			Stream:   combinedMsg.Stream,
+			Data:     combinedMsg.Data,
+		}
+	}
+
+	// If not a combined stream message, try to parse the raw event
+	var rawEvent map[string]interface{}
+	if err := json.Unmarshal(data, &rawEvent); err == nil {
+		// Check if it's a subscription response or error
+		if _, hasResult := rawEvent["result"]; hasResult {
+			log.Printf("[%s] Subscription response: %s", c.clientID, string(data))
+			return Message{ClientID: c.clientID, Stream: "", Data: data}
+		}
+
+		if _, hasError := rawEvent["error"]; hasError {
+			log.Printf("[%s] Error response: %s", c.clientID, string(data))
+			return Message{ClientID: c.clientID, Stream: "", Data: data}
+		}
+
+		// Try to infer stream from event data
+		if eventType, ok := rawEvent["e"].(string); ok {
+			if symbol, ok := rawEvent["s"].(string); ok {
+				var stream string
+				switch eventType {
+				case "trade":
+					stream = strings.ToLower(symbol) + "@trade"
+				case "kline":
+					stream = strings.ToLower(symbol) + "@kline_1m"
+				}
+
+				if stream != "" {
+					return Message{
+						ClientID: c.clientID,
+						Stream:   stream,
+						Data:     data,
+					}
+				}
+			}
+		}
+	}
+
+	// Default case - return message without stream
+	return Message{
+		ClientID: c.clientID,
+		Stream:   "",
+		Data:     data,
 	}
 }
 
@@ -363,34 +441,6 @@ func (c *WebSocketClient) handlePingPong() {
 		select {
 		case <-c.ctx.Done():
 			return
-		case msg := <-c.messageChan:
-			// Handle Binance ping
-			if string(msg.Data) == `{"event":"ping"}` {
-				c.mu.Lock()
-				if c.isConnected && c.conn != nil {
-					if err := c.conn.WriteMessage(websocket.TextMessage, []byte(`{"event":"pong"}`)); err != nil {
-						log.Printf("[%s] Pong error: %v", c.clientID, err)
-						c.disconnect()
-					}
-				}
-				c.mu.Unlock()
-			} else {
-				// Parse combined stream payload
-				var payload struct {
-					Stream string          `json:"stream"`
-					Data   json.RawMessage `json:"data"`
-				}
-				if err := json.Unmarshal(msg.Data, &payload); err == nil && payload.Stream != "" {
-					msg.Stream = payload.Stream
-					msg.Data = payload.Data
-				}
-				// Pass to message channel for worker processing
-				select {
-				case c.messageChan <- msg:
-				default:
-					log.Printf("[%s] Message channel full in handlePingPong, dropping message", c.clientID)
-				}
-			}
 		case <-ticker.C:
 			c.mu.Lock()
 			if c.isConnected && c.conn != nil {
@@ -415,8 +465,21 @@ func (c *WebSocketClient) startWorkers() {
 				case <-c.ctx.Done():
 					return
 				case msg := <-c.messageChan:
-					// Process message in worker for parallel processing
-					go c.handler(msg)
+					// Handle Binance ping
+					if string(msg.Data) == `{"event":"ping"}` {
+						c.mu.Lock()
+						if c.isConnected && c.conn != nil {
+							if err := c.conn.WriteMessage(websocket.TextMessage, []byte(`{"event":"pong"}`)); err != nil {
+								log.Printf("[%s] Pong error: %v", c.clientID, err)
+								c.disconnect()
+							}
+						}
+						c.mu.Unlock()
+						continue
+					}
+
+					// Process the message with the handler
+					c.handler(msg)
 				}
 			}
 		}(i)
@@ -437,6 +500,45 @@ func (c *WebSocketClient) Shutdown() {
 type PriceData struct {
 	mu     sync.RWMutex
 	prices map[string]map[string]float64 // clientID -> symbol -> price
+}
+
+// TradeEvent represents a trade event from Binance
+type TradeEvent struct {
+	EventType string `json:"e"`
+	EventTime int64  `json:"E"`
+	Symbol    string `json:"s"`
+	TradeID   int64  `json:"t"`
+	Price     string `json:"p"`
+	Quantity  string `json:"q"`
+	TradeTime int64  `json:"T"`
+	IsMaker   bool   `json:"m"`
+	Ignore    bool   `json:"M"`
+}
+
+// KlineEvent represents a kline/candlestick event from Binance
+type KlineEvent struct {
+	EventType string `json:"e"`
+	EventTime int64  `json:"E"`
+	Symbol    string `json:"s"`
+	Kline     struct {
+		StartTime           int64  `json:"t"`
+		CloseTime           int64  `json:"T"`
+		Symbol              string `json:"s"`
+		Interval            string `json:"i"`
+		FirstTradeID        int64  `json:"f"`
+		LastTradeID         int64  `json:"L"`
+		Open                string `json:"o"`
+		Close               string `json:"c"`
+		High                string `json:"h"`
+		Low                 string `json:"l"`
+		Volume              string `json:"v"`
+		NumberOfTrades      int64  `json:"n"`
+		IsClosed            bool   `json:"x"`
+		QuoteVolume         string `json:"q"`
+		TakerBuyBaseVolume  string `json:"V"`
+		TakerBuyQuoteVolume string `json:"Q"`
+		Ignore              string `json:"B"`
+	} `json:"k"`
 }
 
 // Example usage with Spot and Futures
@@ -462,53 +564,53 @@ func main() {
 		messageCounter.count++
 		messageCounter.Unlock()
 
-		type TradeEvent struct {
-			EventType string `json:"e"`
-			Symbol    string `json:"s"`
-			Price     string `json:"p"`
-			Quantity  string `json:"q"`
-			TradeTime int64  `json:"T"`
-		}
-		type KlineEvent struct {
-			Symbol string `json:"s"`
-			Kline  struct {
-				Open  string `json:"o"`
-				Close string `json:"c"`
-			} `json:"k"`
+		// Skip if stream is empty (usually system messages)
+		if msg.Stream == "" {
+			// Don't log system messages as frequently
+			return
 		}
 
+		// Log received message
+		log.Printf("[%s] Processing stream %s", msg.ClientID, msg.Stream)
+
+		// Parse message based on stream type
 		if strings.HasSuffix(msg.Stream, "@trade") {
 			var trade TradeEvent
-			if err := json.Unmarshal(msg.Data, &trade); err == nil {
-				price, _ := strconv.ParseFloat(trade.Price, 64)
-				prices.mu.Lock()
-				if prices.prices[msg.ClientID] == nil {
-					prices.prices[msg.ClientID] = make(map[string]float64)
-				}
-				prices.prices[msg.ClientID][trade.Symbol] = price
-				prices.mu.Unlock()
-				fmt.Printf("[%s] Trade - Stream: %s, Symbol: %s, Price: %.2f, Time: %d\n",
-					msg.ClientID, msg.Stream, trade.Symbol, price, trade.TradeTime)
-			} else {
+			if err := json.Unmarshal(msg.Data, &trade); err != nil {
 				log.Printf("[%s] Unmarshal error for trade stream %s: %v", msg.ClientID, msg.Stream, err)
+				return
 			}
-		} else if strings.HasSuffix(msg.Stream, "@kline_1m") {
+
+			price, _ := strconv.ParseFloat(trade.Price, 64)
+			prices.mu.Lock()
+			if prices.prices[msg.ClientID] == nil {
+				prices.prices[msg.ClientID] = make(map[string]float64)
+			}
+			prices.prices[msg.ClientID][trade.Symbol] = price
+			prices.mu.Unlock()
+
+			fmt.Printf("[%s] Trade - Stream: %s, Symbol: %s, Price: %.2f, Time: %d\n",
+				msg.ClientID, msg.Stream, trade.Symbol, price, trade.TradeTime)
+
+		} else if strings.Contains(msg.Stream, "@kline") {
 			var kline KlineEvent
-			if err := json.Unmarshal(msg.Data, &kline); err == nil {
-				price, _ := strconv.ParseFloat(kline.Kline.Close, 64)
-				prices.mu.Lock()
-				if prices.prices[msg.ClientID] == nil {
-					prices.prices[msg.ClientID] = make(map[string]float64)
-				}
-				prices.prices[msg.ClientID][kline.Symbol] = price
-				prices.mu.Unlock()
-				fmt.Printf("[%s] Kline - Stream: %s, Symbol: %s, Close: %.2f\n",
-					msg.ClientID, msg.Stream, kline.Symbol, price)
-			} else {
+			if err := json.Unmarshal(msg.Data, &kline); err != nil {
 				log.Printf("[%s] Unmarshal error for kline stream %s: %v", msg.ClientID, msg.Stream, err)
+				return
 			}
+
+			price, _ := strconv.ParseFloat(kline.Kline.Close, 64)
+			prices.mu.Lock()
+			if prices.prices[msg.ClientID] == nil {
+				prices.prices[msg.ClientID] = make(map[string]float64)
+			}
+			prices.prices[msg.ClientID][kline.Symbol] = price
+			prices.mu.Unlock()
+
+			fmt.Printf("[%s] Kline - Stream: %s, Symbol: %s, Close: %.2f\n",
+				msg.ClientID, msg.Stream, kline.Symbol, price)
 		} else {
-			fmt.Printf("[%s] Stream: %s, Data: %s\n", msg.ClientID, msg.Stream, string(msg.Data))
+			log.Printf("[%s] Unhandled stream: %s", msg.ClientID, msg.Stream)
 		}
 	}
 
@@ -516,7 +618,7 @@ func main() {
 	manager := NewWebSocketManager()
 
 	// Add Spot client
-	spotClient := manager.AddClient("spot", "wss://stream.binance.com:9443", handler, 4)
+	spotClient := manager.AddClient("spot", "wss://stream.binance.com:9443/ws", handler, 4)
 	spotStreams := []string{
 		"btcusdt@trade",
 		"ethusdt@trade",
@@ -526,7 +628,7 @@ func main() {
 	}
 
 	// Add Futures client
-	futuresClient := manager.AddClient("futures", "wss://ws-fapi.binance.com/ws-fapi/v1", handler, 4)
+	futuresClient := manager.AddClient("futures", "wss://fstream.binance.com/ws", handler, 4)
 	futuresStreams := []string{
 		"btcusdt@trade",
 		"ethusdt@kline_1m",
@@ -542,14 +644,14 @@ func main() {
 
 	// Monitor message rate
 	go func() {
-		ticker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				messageCounter.Lock()
 				if messageCounter.count > 0 {
-					log.Printf("Messages per second: %d", messageCounter.count)
+					log.Printf("Messages processed in last 10 seconds: %d", messageCounter.count)
 					messageCounter.count = 0
 				}
 				messageCounter.Unlock()
@@ -562,5 +664,6 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt)
 	<-sigChan
 
+	log.Println("Shutting down...")
 	manager.ShutdownAll()
 }
