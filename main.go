@@ -4,6 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
+	"net"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
 
@@ -12,7 +16,7 @@ import (
 
 // WebSocketClient manages a WebSocket connection with ping/pong, reconnect, and graceful shutdown.
 type WebSocketClient struct {
-	url           string             // WebSocket URL (e.g., wss://stream.binance.com:9443/ws)
+	url           string             // WebSocket URL
 	conn          *websocket.Conn    // Current WebSocket connection
 	messageChan   chan []byte        // Channel for received messages
 	handler       func([]byte)       // Callback for processing messages
@@ -76,7 +80,11 @@ func (c *WebSocketClient) connect() error {
 		return nil
 	}
 
-	conn, _, err := websocket.DefaultDialer.DialContext(c.ctx, c.url, nil)
+	// Use a custom dialer with timeout
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+	conn, _, err := dialer.DialContext(c.ctx, c.url, nil)
 	if err != nil {
 		log.Printf("Connection failed: %v", err)
 		return err
@@ -103,14 +111,16 @@ func (c *WebSocketClient) disconnect() {
 	defer c.mu.Unlock()
 
 	if c.conn != nil {
-		c.conn.Close()
+		if err := c.conn.Close(); err != nil {
+			log.Printf("Error closing connection: %v", err)
+		}
 		c.conn = nil
 		c.isConnected = false
 		log.Printf("Disconnected from %s", c.url)
 	}
 }
 
-// reconnectWithBackoff attempts to reconnect with exponential backoff.
+// reconnectWithBackoff attempts to reconnect with exponential backoff and jitter.
 func (c *WebSocketClient) reconnectWithBackoff() {
 	wait := c.reconnectWait
 	for {
@@ -121,8 +131,10 @@ func (c *WebSocketClient) reconnectWithBackoff() {
 			if err := c.connect(); err == nil {
 				return
 			}
-			log.Printf("Reconnecting in %v...", wait)
-			time.Sleep(wait)
+			// Add jitter to avoid synchronized reconnect attempts
+			jitter := time.Duration(rand.Intn(100)) * time.Millisecond
+			log.Printf("Reconnecting in %v...", wait+jitter)
+			time.Sleep(wait + jitter)
 			wait = wait * 2
 			if wait > c.maxWait {
 				wait = c.maxWait
@@ -142,13 +154,23 @@ func (c *WebSocketClient) readMessages() {
 			if !c.isConnected {
 				return
 			}
+			// Set read deadline to detect stalled connections
+			c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 			_, message, err := c.conn.ReadMessage()
 			if err != nil {
-				log.Printf("Read error: %v", err)
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					log.Printf("WebSocket closed normally: %v", err)
+				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					log.Printf("Read timeout: %v", err)
+				} else {
+					log.Printf("Read error: %v", err)
+				}
 				c.disconnect()
 				return
 			}
-			// Pass message to handler via channel for concurrency safety
+			// Reset deadline
+			c.conn.SetReadDeadline(time.Time{})
+			// Pass message to handler via channel
 			select {
 			case c.messageChan <- message:
 			default:
@@ -161,12 +183,15 @@ func (c *WebSocketClient) readMessages() {
 // handlePingPong responds to ping messages to keep the connection alive.
 func (c *WebSocketClient) handlePingPong() {
 	defer c.wg.Done()
+	ticker := time.NewTicker(30 * time.Second) // Send periodic pings
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case message := <-c.messageChan:
-			// Check for Binance ping message
+			// Handle Binance ping
 			if string(message) == `{"event":"ping"}` {
 				c.mu.Lock()
 				if c.isConnected && c.conn != nil {
@@ -182,24 +207,39 @@ func (c *WebSocketClient) handlePingPong() {
 					go c.handler(message)
 				}
 			}
+		case <-ticker.C:
+			// Send periodic ping to keep connection alive
+			c.mu.Lock()
+			if c.isConnected && c.conn != nil {
+				if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					log.Printf("Ping error: %v", err)
+					c.disconnect()
+				}
+			}
+			c.mu.Unlock()
 		}
 	}
 }
 
 // Shutdown gracefully stops the client.
 func (c *WebSocketClient) Shutdown() {
+	log.Println("Initiating WebSocket client shutdown")
 	c.cancel()
 	c.disconnect()
 	c.wg.Wait()
+	close(c.messageChan)
 	log.Println("WebSocket client shut down")
 }
 
-// Example usage
+// Example usage with Binance
 func main() {
-	// Example handler for processing Binance trade messages
+	// Seed random for jitter
+	rand.Seed(time.Now().UnixNano())
+
+	// Handler for Binance trade messages
 	handler := func(message []byte) {
 		fmt.Printf("Received message: %s\n", string(message))
-		// Add your trading signal logic here, e.g., parse JSON and process trade data
+		// Add trading signal logic here
 	}
 
 	// Create client for Binance Spot trade stream
@@ -208,7 +248,10 @@ func main() {
 		log.Fatalf("Failed to start client: %v", err)
 	}
 
-	// Run for a while, then gracefully shut down
-	time.Sleep(10 * time.Second)
+	// Handle SIGINT for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	<-sigChan
+
 	client.Shutdown()
 }
