@@ -98,10 +98,10 @@ func NewWebSocketClient(clientID, url string, handler func(Message), workerCount
 	return &WebSocketClient{
 		clientID:      clientID,
 		url:           url,
-		messageChan:   make(chan Message, 1000), // Large buffer for multiple streams
+		messageChan:   make(chan Message, 2000), // Increased buffer for multiple streams
 		handler:       handler,
 		reconnect:     true,
-		reconnectWait: time.Second,
+		reconnectWait: 2 * time.Second, // Increased initial wait
 		maxWait:       30 * time.Second,
 		ctx:           ctx,
 		cancel:        cancel,
@@ -118,14 +118,19 @@ func (c *WebSocketClient) Start() error {
 	return c.connect()
 }
 
-// Subscribe adds new streams to the subscription list.
+// Subscribe adds new streams to the subscription list with validation.
 func (c *WebSocketClient) Subscribe(streams ...string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for _, stream := range streams {
+		// Validate stream format (e.g., "btcusdt@trade")
+		if !strings.Contains(stream, "@") || len(strings.Split(stream, "@")) != 2 {
+			return fmt.Errorf("invalid stream format: %s", stream)
+		}
 		c.subscriptions[strings.ToLower(stream)] = struct{}{}
 	}
+	log.Printf("[%s] Subscribed to streams: %v", c.clientID, streams)
 
 	if c.isConnected && c.conn != nil {
 		return c.sendSubscription()
@@ -141,6 +146,7 @@ func (c *WebSocketClient) Unsubscribe(streams ...string) error {
 	for _, stream := range streams {
 		delete(c.subscriptions, strings.ToLower(stream))
 	}
+	log.Printf("[%s] Unsubscribed from streams: %v", c.clientID, streams)
 
 	if c.isConnected && c.conn != nil {
 		return c.sendSubscription()
@@ -158,6 +164,7 @@ func (c *WebSocketClient) sendSubscription() error {
 	for stream := range c.subscriptions {
 		streams = append(streams, stream)
 	}
+	log.Printf("[%s] Sending subscription for streams: %v", c.clientID, streams)
 
 	subMsg := map[string]interface{}{
 		"method": "SUBSCRIBE",
@@ -185,6 +192,32 @@ func (c *WebSocketClient) run() {
 	}
 }
 
+// lookupHostWithRetry attempts DNS resolution with retries and fallback resolvers.
+func lookupHostWithRetry(host string, retries int, timeout time.Duration) ([]string, error) {
+	resolvers := []string{"8.8.8.8:53", "1.1.1.1:53"} // Google and Cloudflare DNS
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: timeout}
+			return d.DialContext(ctx, network, address)
+		},
+	}
+
+	for attempt := 0; attempt < retries; attempt++ {
+		for _, addr := range resolvers {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			addrs, err := resolver.LookupHost(ctx, host)
+			cancel()
+			if err == nil {
+				return addrs, nil
+			}
+			log.Printf("DNS lookup attempt %d failed for %s on %s: %v", attempt+1, host, addr, err)
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+	}
+	return nil, fmt.Errorf("DNS lookup failed after %d retries", retries)
+}
+
 // connect establishes a WebSocket connection and subscribes to streams.
 func (c *WebSocketClient) connect() error {
 	c.mu.Lock()
@@ -193,6 +226,15 @@ func (c *WebSocketClient) connect() error {
 	if c.isConnected {
 		return nil
 	}
+
+	// Retry DNS lookup with fallback resolvers
+	host := strings.Split(strings.TrimPrefix(c.url, "wss://"), "/")[0]
+	addrs, err := lookupHostWithRetry(host, 3, 2*time.Second)
+	if err != nil {
+		log.Printf("[%s] DNS lookup failed after retries: %v", c.clientID, err)
+		return err
+	}
+	log.Printf("[%s] Resolved IPs for %s: %v", c.clientID, host, addrs)
 
 	// Build URL with combined streams
 	streams := make([]string, 0, len(c.subscriptions))
@@ -203,9 +245,10 @@ func (c *WebSocketClient) connect() error {
 	if len(streams) > 0 {
 		url = fmt.Sprintf("%s/stream?streams=%s", c.url, strings.Join(streams, "/"))
 	}
+	log.Printf("[%s] Connecting to URL: %s", c.clientID, url)
 
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 30 * time.Second, // Increased timeout
+		HandshakeTimeout: 30 * time.Second,
 	}
 	conn, _, err := dialer.DialContext(c.ctx, url, nil)
 	if err != nil {
@@ -263,7 +306,7 @@ func (c *WebSocketClient) reconnectWithBackoff() {
 			attempts++
 			if attempts > 5 {
 				log.Printf("[%s] Alert: Possible IP ban after %d attempts", c.clientID, attempts)
-				time.Sleep(5 * time.Minute) // Wait longer to avoid ban
+				time.Sleep(5 * time.Minute)
 			}
 			jitter := time.Duration(rand.Intn(100)) * time.Millisecond
 			log.Printf("[%s] Reconnecting (attempt %d) in %v...", c.clientID, attempts, wait+jitter)
@@ -287,7 +330,7 @@ func (c *WebSocketClient) readMessages() {
 			if !c.isConnected {
 				return
 			}
-			c.conn.SetReadDeadline(time.Now().Add(120 * time.Second)) // Increased timeout
+			c.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 			_, message, err := c.conn.ReadMessage()
 			if err != nil {
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
@@ -446,7 +489,6 @@ func main() {
 				prices.mu.Unlock()
 				fmt.Printf("[%s] Trade - Stream: %s, Symbol: %s, Price: %.2f, Time: %d\n",
 					msg.ClientID, msg.Stream, trade.Symbol, price, trade.TradeTime)
-				// Add trading signal logic here
 			} else {
 				log.Printf("[%s] Unmarshal error for trade stream %s: %v", msg.ClientID, msg.Stream, err)
 			}
@@ -462,7 +504,6 @@ func main() {
 				prices.mu.Unlock()
 				fmt.Printf("[%s] Kline - Stream: %s, Symbol: %s, Close: %.2f\n",
 					msg.ClientID, msg.Stream, kline.Symbol, price)
-				// Add trading signal logic here
 			} else {
 				log.Printf("[%s] Unmarshal error for kline stream %s: %v", msg.ClientID, msg.Stream, err)
 			}
@@ -479,10 +520,6 @@ func main() {
 	spotStreams := []string{
 		"btcusdt@trade",
 		"ethusdt@trade",
-		"bnbusdt@trade",
-		"adausdt@trade",
-		"xrpusdt@trade",
-		// Add more Spot coins (e.g., 50 total)
 	}
 	if err := spotClient.Subscribe(spotStreams...); err != nil {
 		log.Fatalf("Failed to subscribe to Spot streams: %v", err)
@@ -493,10 +530,6 @@ func main() {
 	futuresStreams := []string{
 		"btcusdt@trade",
 		"ethusdt@kline_1m",
-		"bnbusdt@trade",
-		"adausdt@kline_1m",
-		"xrpusdt@trade",
-		// Add more Futures coins (e.g., 50 total)
 	}
 	if err := futuresClient.Subscribe(futuresStreams...); err != nil {
 		log.Fatalf("Failed to subscribe to Futures streams: %v", err)
