@@ -205,7 +205,7 @@ func (c *WebSocketClient) connect() error {
 	}
 
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
+		HandshakeTimeout: 30 * time.Second, // Increased timeout
 	}
 	conn, _, err := dialer.DialContext(c.ctx, url, nil)
 	if err != nil {
@@ -247,6 +247,7 @@ func (c *WebSocketClient) disconnect() {
 	}
 }
 
+// reconnectWithBackoff attempts to reconnect with exponential backoff and jitter.
 func (c *WebSocketClient) reconnectWithBackoff() {
 	wait := c.reconnectWait
 	attempts := 0
@@ -262,8 +263,7 @@ func (c *WebSocketClient) reconnectWithBackoff() {
 			attempts++
 			if attempts > 5 {
 				log.Printf("[%s] Alert: Possible IP ban after %d attempts", c.clientID, attempts)
-				// Wait longer to avoid ban
-				time.Sleep(5 * time.Minute)
+				time.Sleep(5 * time.Minute) // Wait longer to avoid ban
 			}
 			jitter := time.Duration(rand.Intn(100)) * time.Millisecond
 			log.Printf("[%s] Reconnecting (attempt %d) in %v...", c.clientID, attempts, wait+jitter)
@@ -287,7 +287,7 @@ func (c *WebSocketClient) readMessages() {
 			if !c.isConnected {
 				return
 			}
-			c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			c.conn.SetReadDeadline(time.Now().Add(120 * time.Second)) // Increased timeout
 			_, message, err := c.conn.ReadMessage()
 			if err != nil {
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
