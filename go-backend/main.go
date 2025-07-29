@@ -234,48 +234,6 @@ func (c *WebSocketClient) Start() error {
 var dnsCache = make(map[string][]string)
 var dnsMutex sync.RWMutex
 
-// lookupHostWithRetry attempts DNS resolution with retries
-func lookupHostWithRetry(host string, retries int, timeout time.Duration) ([]string, error) {
-	dnsMutex.RLock()
-	cached, exists := dnsCache[host]
-	dnsMutex.RUnlock()
-
-	if exists {
-		return cached, nil
-	}
-
-	if strings.Contains(host, ":") {
-		host = strings.Split(host, ":")[0]
-	}
-
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: timeout}
-			return d.DialContext(ctx, "udp", "8.8.8.8:53")
-		},
-	}
-
-	for attempt := 0; attempt < retries; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		addrs, err := resolver.LookupHost(ctx, host)
-		cancel()
-
-		if err == nil {
-			dnsMutex.Lock()
-			dnsCache[host] = addrs
-			dnsMutex.Unlock()
-			return addrs, nil
-		}
-
-		if attempt < retries-1 {
-			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
-		}
-	}
-
-	return nil, fmt.Errorf("DNS lookup failed after %d retries for %s", retries, host)
-}
-
 // connect establishes a WebSocket connection with reliable DNS resolution
 func (c *WebSocketClient) connect() error {
 	c.mu.Lock()
@@ -557,24 +515,59 @@ type DatabaseManager struct {
 	mu     sync.Mutex
 }
 
-// NewDatabaseManager creates a new QuestDB manager
 func NewDatabaseManager(config *Config) (*DatabaseManager, error) {
 	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 		config.QuestDBHost, config.QuestDBPort, config.QuestDBUser, config.QuestDBPass, config.QuestDBName)
 
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to QuestDB: %v", err)
+	// Initialize random seed for jitter
+	rand.Seed(time.Now().UnixNano())
+
+	var db *sql.DB
+	var lastErr error
+	maxAttempts := 5
+	baseDelay := 1 * time.Second
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Try to establish connection
+		db, lastErr = sql.Open("postgres", connStr)
+		if lastErr == nil {
+			// Configure connection pool
+			db.SetMaxOpenConns(config.MaxDBConnections)
+			db.SetMaxIdleConns(5)
+			db.SetConnMaxLifetime(30 * time.Minute)
+
+			// Verify connection with ping
+			lastErr = db.Ping()
+			if lastErr == nil {
+				break // Successfully connected and verified
+			}
+
+			// Close the connection if ping failed
+			db.Close()
+		}
+
+		// Calculate next retry delay if needed
+		if attempt < maxAttempts-1 {
+			delay := baseDelay * (1 << attempt) // Exponential backoff: 2^attempt
+			jitter := time.Duration(rand.Int63n(int64(delay / 2)))
+			totalDelay := delay + jitter
+
+			log.Printf("Connection attempt %d failed: %v. Retrying in %v",
+				attempt+1, lastErr, totalDelay.Round(time.Millisecond))
+
+			time.Sleep(totalDelay)
+		}
 	}
 
-	db.SetMaxOpenConns(config.MaxDBConnections)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(30 * time.Minute)
-
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping QuestDB: %v", err)
+	// Check if all attempts failed
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to connect to QuestDB after %d attempts: %v", maxAttempts, lastErr)
 	}
 
+	// Database connection established successfully
+	log.Println("Successfully connected to QuestDB")
+
+	// ... rest of the initialization remains the same ...
 	ctx, cancel := context.WithCancel(context.Background())
 
 	dm := &DatabaseManager{
@@ -898,7 +891,6 @@ type StreamManager struct {
 	symbols   []string
 	ctx       context.Context
 	cancel    context.CancelFunc
-	wg        sync.WaitGroup
 }
 
 // NewStreamManager creates a new stream manager

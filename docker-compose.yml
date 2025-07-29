@@ -5,6 +5,8 @@ services:
     container_name: binance_data_stream
     environment:
       - APP_ENV=docker
+      - QUESTDB_HOST=questdb
+      - QUESTDB_PORT=8812
       - CONFIG_FILE=app/config/docker.yaml
     volumes:
       - ./go-backend:/app
