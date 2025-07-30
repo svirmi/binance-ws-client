@@ -567,7 +567,6 @@ func NewDatabaseManager(config *Config) (*DatabaseManager, error) {
 	// Database connection established successfully
 	log.Println("Successfully connected to QuestDB")
 
-	// ... rest of the initialization remains the same ...
 	ctx, cancel := context.WithCancel(context.Background())
 
 	dm := &DatabaseManager{
@@ -1120,11 +1119,8 @@ func (s *Statistics) IncrementMessages() {
 }
 
 // GetStats returns current statistics
-func (s *Statistics) GetStats() (int64, int64, int64, time.Duration) {
-	return atomic.LoadInt64(&s.tradesProcessed),
-		atomic.LoadInt64(&s.klinesProcessed),
-		atomic.LoadInt64(&s.messagesReceived),
-		time.Since(s.startTime)
+func (s *Statistics) GetStats() time.Duration {
+	return time.Since(s.startTime)
 }
 
 func main() {
@@ -1179,29 +1175,31 @@ func main() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				trades, klines, messages, uptime := stats.GetStats()
-				log.Printf("STATS: Uptime=%v Messages=%d Trades=%d Klines=%d",
-					uptime.Round(time.Second), messages, trades, klines)
-			}
+		for range ticker.C {
+			uptime := stats.GetStats()
+			log.Printf("STATS: Uptime=%v", uptime.Round(time.Second))
 		}
 	}()
 
-	// Memory monitoring
+	// Memory and goroutines monitoring
 	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				var m runtime.MemStats
-				runtime.ReadMemStats(&m)
-				log.Printf("MEMORY: Alloc=%.2fMB Sys=%.2fMB NumGC=%d",
-					float64(m.Alloc)/1024/1024, float64(m.Sys)/1024/1024, m.NumGC)
-			}
+		for range ticker.C {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			gcPauseSeconds := float64(m.PauseTotalNs) / 1e9
+			goroutines := runtime.NumGoroutine()
+
+			log.Printf(
+				"SYSTEM: Alloc=%.2fMB Sys=%.2fMB Goroutines=%d GCs=%d GCPause=%.3fs",
+				float64(m.Alloc)/1024/1024,
+				float64(m.Sys)/1024/1024,
+				goroutines,
+				m.NumGC,
+				gcPauseSeconds,
+			)
 		}
 	}()
 
@@ -1217,8 +1215,7 @@ func main() {
 	streamManager.Close()
 	dbManager.Close()
 
-	trades, klines, messages, uptime := stats.GetStats()
-	log.Printf("FINAL STATS: Uptime=%v Messages=%d Trades=%d Klines=%d",
-		uptime.Round(time.Second), messages, trades, klines)
+	uptime := stats.GetStats()
+	log.Printf("FINAL STATS: Uptime=%v", uptime.Round(time.Second))
 	log.Printf("Shutdown completed in %v", time.Since(startShutdown))
 }
