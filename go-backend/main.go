@@ -230,10 +230,6 @@ func (c *WebSocketClient) Start() error {
 	return c.connect()
 }
 
-// DNS cache for improved resilience
-var dnsCache = make(map[string][]string)
-var dnsMutex sync.RWMutex
-
 // connect establishes a WebSocket connection with reliable DNS resolution
 func (c *WebSocketClient) connect() error {
 	c.mu.Lock()
@@ -609,6 +605,11 @@ func (dm *DatabaseManager) dbHealthCheck() {
 
 // initTables creates necessary QuestDB tables
 func (dm *DatabaseManager) initTables() error {
+
+	dropTradesTable := `DROP TABLE IF EXISTS trades;`
+
+	dropKLinesTable := `DROP TABLE IF EXISTS klines;`
+
 	// Create trades table with designated timestamp
 	tradeTable := `
 	CREATE TABLE IF NOT EXISTS trades (
@@ -619,7 +620,7 @@ func (dm *DatabaseManager) initTables() error {
 		quantity DOUBLE,
 		is_buyer_maker BOOLEAN,
 		processed_at TIMESTAMP
-	) TIMESTAMP(trade_time) PARTITION BY DAY;
+	) TIMESTAMP(trade_time) PARTITION BY HOUR TTL 1 MONTH;
 	`
 
 	// Create klines table with designated timestamp
@@ -637,8 +638,16 @@ func (dm *DatabaseManager) initTables() error {
 		volume DOUBLE,
 		is_closed BOOLEAN,
 		processed_at TIMESTAMP
-	) TIMESTAMP(open_time) PARTITION BY DAY;
+	) TIMESTAMP(open_time) PARTITION BY HOUR TTL 1 MONTH;
 	`
+
+	if _, err := dm.db.Exec(dropTradesTable); err != nil {
+		return fmt.Errorf("failed to drop trades table: %v", err)
+	}
+
+	if _, err := dm.db.Exec(dropKLinesTable); err != nil {
+		return fmt.Errorf("failed to drop klines table: %v", err)
+	}
 
 	if _, err := dm.db.Exec(tradeTable); err != nil {
 		return fmt.Errorf("failed to create trades table: %v", err)
