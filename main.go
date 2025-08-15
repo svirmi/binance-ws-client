@@ -234,48 +234,6 @@ func (c *WebSocketClient) Start() error {
 var dnsCache = make(map[string][]string)
 var dnsMutex sync.RWMutex
 
-// lookupHostWithRetry attempts DNS resolution with retries
-func lookupHostWithRetry(host string, retries int, timeout time.Duration) ([]string, error) {
-	dnsMutex.RLock()
-	cached, exists := dnsCache[host]
-	dnsMutex.RUnlock()
-
-	if exists {
-		return cached, nil
-	}
-
-	if strings.Contains(host, ":") {
-		host = strings.Split(host, ":")[0]
-	}
-
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: timeout}
-			return d.DialContext(ctx, "udp", "8.8.8.8:53")
-		},
-	}
-
-	for attempt := 0; attempt < retries; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		addrs, err := resolver.LookupHost(ctx, host)
-		cancel()
-
-		if err == nil {
-			dnsMutex.Lock()
-			dnsCache[host] = addrs
-			dnsMutex.Unlock()
-			return addrs, nil
-		}
-
-		if attempt < retries-1 {
-			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
-		}
-	}
-
-	return nil, fmt.Errorf("DNS lookup failed after %d retries for %s", retries, host)
-}
-
 // connect establishes a WebSocket connection with reliable DNS resolution
 func (c *WebSocketClient) connect() error {
 	c.mu.Lock()
