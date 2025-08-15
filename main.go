@@ -571,6 +571,15 @@ func (dm *DatabaseManager) dbHealthCheck() {
 
 // initTables creates necessary QuestDB tables
 func (dm *DatabaseManager) initTables() error {
+
+	if _, err := dm.db.Exec("DROP TABLE IF EXISTS trades"); err != nil {
+		return fmt.Errorf("failed to DROP trades table: %v", err)
+	}
+
+	if _, err := dm.db.Exec("DROP TABLE IF EXISTS klines"); err != nil {
+		return fmt.Errorf("failed to DROP klines table: %v", err)
+	}
+
 	// Create trades table with designated timestamp
 	tradeTable := `
 	CREATE TABLE IF NOT EXISTS trades (
@@ -581,7 +590,7 @@ func (dm *DatabaseManager) initTables() error {
 		quantity DOUBLE,
 		is_buyer_maker BOOLEAN,
 		processed_at TIMESTAMP
-	) TIMESTAMP(trade_time) PARTITION BY DAY;
+	) TIMESTAMP(trade_time) PARTITION BY DAY TTL 21 DAY;
 	`
 
 	// Create klines table with designated timestamp
@@ -599,7 +608,7 @@ func (dm *DatabaseManager) initTables() error {
 		volume DOUBLE,
 		is_closed BOOLEAN,
 		processed_at TIMESTAMP
-	) TIMESTAMP(open_time) PARTITION BY DAY;
+	) TIMESTAMP(open_time) PARTITION BY DAY TTL 21 DAY;
 	`
 
 	if _, err := dm.db.Exec(tradeTable); err != nil {
