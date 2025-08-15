@@ -230,10 +230,6 @@ func (c *WebSocketClient) Start() error {
 	return c.connect()
 }
 
-// DNS cache for improved resilience
-var dnsCache = make(map[string][]string)
-var dnsMutex sync.RWMutex
-
 // connect establishes a WebSocket connection with reliable DNS resolution
 func (c *WebSocketClient) connect() error {
 	c.mu.Lock()
