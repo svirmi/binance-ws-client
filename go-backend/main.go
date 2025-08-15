@@ -1158,10 +1158,7 @@ func main() {
 	}
 
 	symbols := []string{
-		"BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "XRPUSDT",
-		"SOLUSDT", "DOTUSDT", "DOGEUSDT", "AVAXUSDT", "LUNAUSDT",
-		"SHIBUSDT", "MATICUSDT", "NEARUSDT", "ATOMUSDT", "LINKUSDT",
-		"LTCUSDT", "BCHUSDT", "FILUSDT", "TRXUSDT", "ETCUSDT",
+		"BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT",
 	}
 
 	log.Printf("Starting crypto data collector for %d symbols", len(symbols))
