@@ -491,7 +491,7 @@ func (c *WebSocketClient) Shutdown() {
 	c.cancel()
 	c.disconnect()
 	c.wg.Wait()
-	close(c.messageChan)
+	close(c.messageChan) // Close channel after all workers have stopped
 }
 
 // DatabaseManager handles all QuestDB operations
@@ -605,41 +605,40 @@ func (dm *DatabaseManager) dbHealthCheck() {
 
 // initTables creates necessary QuestDB tables
 func (dm *DatabaseManager) initTables() error {
-
+	// WARNING: Dropping tables will delete all existing data. Use with caution in production.
 	dropTradesTable := `DROP TABLE IF EXISTS trades;`
-
 	dropKLinesTable := `DROP TABLE IF EXISTS klines;`
 
 	// Create trades table with designated timestamp
 	tradeTable := `
-	CREATE TABLE IF NOT EXISTS trades (
-		trade_time TIMESTAMP,
-		client_id SYMBOL,
-		symbol SYMBOL,
-		price DOUBLE,
-		quantity DOUBLE,
-		is_buyer_maker BOOLEAN,
-		processed_at TIMESTAMP
-	) TIMESTAMP(trade_time) PARTITION BY HOUR TTL 1 MONTH;
-	`
+    CREATE TABLE IF NOT EXISTS trades (
+        trade_time TIMESTAMP,
+        client_id SYMBOL,
+        symbol SYMBOL,
+        price DOUBLE,
+        quantity DOUBLE,
+        is_buyer_maker BOOLEAN,
+        processed_at TIMESTAMP
+    ) TIMESTAMP(trade_time) PARTITION BY HOUR TTL 1 MONTH;
+    `
 
 	// Create klines table with designated timestamp
 	klineTable := `
-	CREATE TABLE IF NOT EXISTS klines (
-		open_time TIMESTAMP,
-		client_id SYMBOL,
-		symbol SYMBOL,
-		interval SYMBOL,
-		close_time TIMESTAMP,
-		open_price DOUBLE,
-		high_price DOUBLE,
-		low_price DOUBLE,
-		close_price DOUBLE,
-		volume DOUBLE,
-		is_closed BOOLEAN,
-		processed_at TIMESTAMP
-	) TIMESTAMP(open_time) PARTITION BY HOUR TTL 1 MONTH;
-	`
+    CREATE TABLE IF NOT EXISTS klines (
+        open_time TIMESTAMP,
+        client_id SYMBOL,
+        symbol SYMBOL,
+        interval SYMBOL,
+        close_time TIMESTAMP,
+        open_price DOUBLE,
+        high_price DOUBLE,
+        low_price DOUBLE,
+        close_price DOUBLE,
+        volume DOUBLE,
+        is_closed BOOLEAN,
+        processed_at TIMESTAMP
+    ) TIMESTAMP(open_time) PARTITION BY HOUR TTL 1 MONTH;
+    `
 
 	if _, err := dm.db.Exec(dropTradesTable); err != nil {
 		return fmt.Errorf("failed to drop trades table: %v", err)
@@ -767,29 +766,30 @@ func (dm *DatabaseManager) flushTrades() {
 	}
 	defer tx.Rollback()
 
-	// Prepare bulk insert
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO trades (
-			trade_time, client_id, symbol, price, quantity, 
-			is_buyer_maker, processed_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`)
-	if err != nil {
-		log.Printf("Failed to prepare trade statement: %v", err)
-		return
-	}
-	defer stmt.Close()
-
-	// Execute batch
-	for _, trade := range batch {
-		_, err := stmt.ExecContext(ctx,
-			trade.TradeTime, trade.ClientID, trade.Symbol, trade.Price, trade.Quantity,
-			trade.IsBuyerMaker, trade.ProcessedAt,
-		)
-		if err != nil {
-			log.Printf("Failed to insert trade: %v", err)
-			return
+	// Build the insert query with formatted values
+	var b strings.Builder
+	b.WriteString("INSERT INTO trades (trade_time, client_id, symbol, price, quantity, is_buyer_maker, processed_at) VALUES")
+	for i, trade := range batch {
+		if i > 0 {
+			b.WriteString(",")
 		}
+		b.WriteString(fmt.Sprintf(" ('%s', '%s', '%s', %f, %f, %t, '%s')",
+			trade.TradeTime.Format("2006-01-02T15:04:05.999Z"),
+			trade.ClientID,
+			trade.Symbol,
+			trade.Price,
+			trade.Quantity,
+			trade.IsBuyerMaker,
+			trade.ProcessedAt.Format("2006-01-02T15:04:05.999Z"),
+		))
+	}
+	query := b.String()
+
+	// Execute the query
+	_, err = tx.ExecContext(ctx, query)
+	if err != nil {
+		log.Printf("Failed to insert batch trades: %v", err)
+		return
 	}
 
 	// Commit transaction
@@ -823,31 +823,35 @@ func (dm *DatabaseManager) flushKlines() {
 	}
 	defer tx.Rollback()
 
-	// Prepare bulk insert
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO klines (
-			open_time, client_id, symbol, interval, close_time,
-			open_price, high_price, low_price, close_price, 
-			volume, is_closed, processed_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-	`)
-	if err != nil {
-		log.Printf("Failed to prepare kline statement: %v", err)
-		return
-	}
-	defer stmt.Close()
-
-	// Execute batch
-	for _, kline := range batch {
-		_, err := stmt.ExecContext(ctx,
-			kline.OpenTime, kline.ClientID, kline.Symbol, kline.Interval, kline.CloseTime,
-			kline.Open, kline.High, kline.Low, kline.Close,
-			kline.Volume, kline.IsClosed, kline.ProcessedAt,
-		)
-		if err != nil {
-			log.Printf("Failed to insert kline: %v", err)
-			return
+	// Build the insert query with formatted values
+	var b strings.Builder
+	b.WriteString("INSERT INTO klines (open_time, client_id, symbol, interval, close_time, open_price, high_price, low_price, close_price, volume, is_closed, processed_at) VALUES")
+	for i, kline := range batch {
+		if i > 0 {
+			b.WriteString(",")
 		}
+		b.WriteString(fmt.Sprintf(" ('%s', '%s', '%s', '%s', '%s', %f, %f, %f, %f, %f, %t, '%s')",
+			kline.OpenTime.Format("2006-01-02T15:04:05.999Z"),
+			kline.ClientID,
+			kline.Symbol,
+			kline.Interval,
+			kline.CloseTime.Format("2006-01-02T15:04:05.999Z"),
+			kline.Open,
+			kline.High,
+			kline.Low,
+			kline.Close,
+			kline.Volume,
+			kline.IsClosed,
+			kline.ProcessedAt.Format("2006-01-02T15:04:05.999Z"),
+		))
+	}
+	query := b.String()
+
+	// Execute the query
+	_, err = tx.ExecContext(ctx, query)
+	if err != nil {
+		log.Printf("Failed to insert batch klines: %v", err)
+		return
 	}
 
 	// Commit transaction
