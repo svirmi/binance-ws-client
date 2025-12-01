@@ -20,7 +20,7 @@ services:
   questdb:
     image: questdb/questdb
     container_name: questdb
-    restart: always
+    # restart: always
     ports:
       - "8812:8812"
       - "9000:9000"
