@@ -62,40 +62,103 @@ func NewBinanceFuturesWebSocketClient(symbols []string) *BinanceFuturesWebSocket
 	}
 }
 
-// Start connects and starts receiving data
+// Start kicks off the main run loop that manages connection and reconnection.
 func (c *BinanceFuturesWebSocketClient) Start() error {
+	if !c.isRunning.CompareAndSwap(false, true) {
+		return fmt.Errorf("client already running")
+	}
+
+	c.wg.Add(1)
+	go c.run()
+
+	return nil
+}
+
+// run manages the connect → read/heartbeat → reconnect loop.
+func (c *BinanceFuturesWebSocketClient) run() {
+	defer c.wg.Done()
+
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
+	for c.isRunning.Load() {
+		// Top-level context canceled? Then we exit the whole run loop.
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+
+		// --- Connect ---
+		conn, err := c.connect()
+		if err != nil {
+			log.Printf("Failed to connect: %v", err)
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Reset backoff on successful connect
+		backoff = time.Second
+		c.conn = conn
+		log.Println("Connected and subscribed successfully")
+
+		// --- Per-connection context ---
+		connCtx, connCancel := context.WithCancel(c.ctx)
+
+		// Start loops tied to this connection
+		var connWG sync.WaitGroup
+		connWG.Add(2)
+		go c.readLoop(connCtx, &connWG)
+		go c.heartbeatLoop(connCtx, &connWG)
+
+		// Wait until both loops finish
+		connWG.Wait()
+		connCancel()
+
+		// Close this connection safely once loops are done
+		if c.conn != nil {
+			_ = c.conn.Close()
+			c.conn = nil
+		}
+
+		if !c.isRunning.Load() || c.ctx.Err() != nil {
+			return
+		}
+
+		log.Println("Attempting to reconnect...")
+	}
+}
+
+// connect dials Binance, sets handlers, and subscribes to bookTicker streams.
+func (c *BinanceFuturesWebSocketClient) connect() (*websocket.Conn, error) {
 	log.Printf("Starting Binance Futures WebSocket client for %d symbols", len(c.symbols))
 
-	// Create connection
 	conn, _, err := websocket.DefaultDialer.Dial(c.url, nil)
 	if err != nil {
-		return fmt.Errorf("failed to connect to Binance: %w", err)
+		return nil, fmt.Errorf("failed to connect to Binance: %w", err)
 	}
-	c.conn = conn
 
-	// Set initial read deadline and handlers
-	// Choose a generous read timeout; we'll extend it in the pong handler.
-	readTimeout := 90 * time.Second
-	c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+	readTimeout := 10 * time.Second
+	conn.SetReadDeadline(time.Now().Add(readTimeout))
 
-	// Pong handler extends deadline
-	c.conn.SetPongHandler(func(appData string) error {
-		// extend read deadline on every pong
-		_ = c.conn.SetReadDeadline(time.Now().Add(readTimeout))
-		log.Printf("Received pong (extend read deadline): %s", appData)
+	conn.SetPongHandler(func(appData string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+		// You can log if you want, but it's often noisy:
+		// log.Printf("Received pong: %s", appData)
 		return nil
 	})
 
-	// Ping handler: respond with a pong control frame
-	c.conn.SetPingHandler(func(appData string) error {
-		// write pong control frame in reply to server ping
+	conn.SetPingHandler(func(appData string) error {
 		deadline := time.Now().Add(5 * time.Second)
-		err := c.conn.WriteControl(websocket.PongMessage, []byte(appData), deadline)
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), deadline)
 		if err != nil {
 			log.Printf("Failed to send pong in PingHandler: %v", err)
 		} else {
-			// also extend read deadline locally to avoid read timeout
-			_ = c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+			_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 		}
 		return nil
 	})
@@ -113,65 +176,77 @@ func (c *BinanceFuturesWebSocketClient) Start() error {
 		"id":     1,
 	}
 
-	if err := c.conn.WriteJSON(subscribeMsg); err != nil {
-		c.conn.Close()
-		return fmt.Errorf("failed to subscribe: %w", err)
+	if err := conn.WriteJSON(subscribeMsg); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to subscribe: %w", err)
 	}
 
-	c.isRunning.Store(true)
-
-	// Start reader
-	c.wg.Add(1)
-	go c.readMessages()
-
-	log.Println("Connected and subscribed successfully")
-	return nil
+	return conn, nil
 }
 
-// readMessages reads and processes incoming messages
-func (c *BinanceFuturesWebSocketClient) readMessages() {
-	defer c.wg.Done()
-	defer func() {
-		if c.conn != nil {
-			c.conn.Close()
-		}
-	}()
+// readLoop reads and processes incoming messages for a single connection.
+func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connWG *sync.WaitGroup) {
+	defer connWG.Done()
 
-	// Start heartbeat monitor
-	c.wg.Add(1)
-	go c.heartbeatMonitor()
-
-	for c.isRunning.Load() {
+	for {
 		select {
-		case <-c.ctx.Done():
+		case <-connCtx.Done():
 			return
 		default:
-			// Set a read deadline - pong handler will extend this
-			c.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		}
 
-			_, message, err := c.conn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					log.Printf("WebSocket read error: %v", err)
-				} else {
-					log.Printf("WebSocket read error (non-unexpected): %v", err)
-				}
-				// Try to reconnect (only if still running)
-				c.reconnect()
+		if c.conn == nil {
+			return
+		}
+
+		c.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("WebSocket read error: %v", err)
+			} else {
+				log.Printf("WebSocket read error (non-unexpected): %v", err)
+			}
+			// Returning will cause connWG.Wait() to finish, which triggers reconnect in run().
+			return
+		}
+
+		c.processMessage(message)
+		c.msgCounter.Add(1)
+	}
+}
+
+// heartbeatLoop sends periodic pings to keep connection alive.
+func (c *BinanceFuturesWebSocketClient) heartbeatLoop(connCtx context.Context, connWG *sync.WaitGroup) {
+	defer connWG.Done()
+
+	// Binance recommends ping/pong every 3 minutes if idle
+	interval := 3 * time.Minute
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-connCtx.Done():
+			return
+		case <-ticker.C:
+			if c.conn == nil {
 				return
 			}
-
-			c.processMessage(message)
-			c.msgCounter.Add(1)
+			deadline := time.Now().Add(5 * time.Second)
+			payload := []byte(fmt.Sprintf("%d", time.Now().UnixMilli()))
+			if err := c.conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
+				log.Printf("Failed to send ping control frame: %v", err)
+				// Returning will end this loop; run() detects both loops finished and reconnects.
+				return
+			}
 		}
 	}
 }
 
 // processMessage handles incoming WebSocket messages
 func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
-	// Skip ping/pong control frames are handled at control level; websocket.ReadMessage returns only application messages.
-	// However some server control messages might be in JSON "result" etc — still handled below.
-
 	// Try to parse as book ticker event first (direct format)
 	var bookTicker BookTickerData
 	if err := json.Unmarshal(data, &bookTicker); err == nil {
@@ -205,15 +280,14 @@ func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
 			// Subscription confirmation, ignore
 			return
 		}
-		if _, ok := controlMsg["error"]; ok {
-			log.Printf("Received error from Binance: %v", controlMsg["error"])
+		if errVal, ok := controlMsg["error"]; ok {
+			log.Printf("Received error from Binance: %v", errVal)
 			return
 		}
 	}
 
-	// Log unhandled messages for debugging (skip empty messages)
+	// Log unhandled messages for debugging (skip very small ones)
 	if len(data) > 10 {
-		// Try to see what the message looks like
 		log.Printf("DEBUG - Unhandled message structure: %s", string(data))
 	}
 }
@@ -236,96 +310,22 @@ func (c *BinanceFuturesWebSocketClient) logBookTicker(ticker BookTickerData) {
 		ts.Format("15:04:05.000"))
 }
 
-// reconnect attempts to reconnect with exponential backoff
-func (c *BinanceFuturesWebSocketClient) reconnect() {
-	if !c.isRunning.Load() {
-		return
-	}
-
-	log.Println("Attempting to reconnect...")
-
-	backoff := time.Second
-	maxBackoff := 30 * time.Second
-	attempts := 0
-
-	for c.isRunning.Load() {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-time.After(backoff):
-			attempts++
-			log.Printf("Reconnection attempt %d", attempts)
-
-			// Close old connection if exists
-			if c.conn != nil {
-				c.conn.Close()
-				c.conn = nil
-			}
-
-			// Try to reconnect
-			if err := c.Start(); err != nil {
-				log.Printf("Reconnection failed: %v", err)
-
-				// Exponential backoff with jitter
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-
-				// Add jitter
-				jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
-				backoff += jitter
-				continue
-			}
-
-			// Reconnection successful
-			log.Println("Reconnected successfully")
-			return
-		}
-	}
-}
-
-// heartbeatMonitor sends periodic pings to keep connection alive
-func (c *BinanceFuturesWebSocketClient) heartbeatMonitor() {
-	defer c.wg.Done()
-
-	// Binance recommends ping/pong every 3 minutes if idle; choose interval < read timeout
-	interval := 3 * time.Minute
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for c.isRunning.Load() {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-ticker.C:
-			if c.conn != nil {
-				// Send a WebSocket Ping control frame (NOT a JSON app message)
-				deadline := time.Now().Add(5 * time.Second)
-				payload := []byte(fmt.Sprintf("%d", time.Now().UnixMilli()))
-				if err := c.conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
-					log.Printf("Failed to send ping control frame: %v", err)
-					// Consider triggering reconnect on write failure
-				} else {
-					log.Println("Sent ping control frame")
-				}
-			}
-		}
-	}
-}
-
 // Stop gracefully stops the client
 func (c *BinanceFuturesWebSocketClient) Stop() {
 	log.Println("Stopping Binance Futures WebSocket client...")
 
-	c.isRunning.Store(false)
+	if !c.isRunning.CompareAndSwap(true, false) {
+		return
+	}
+
 	c.cancel()
 
-	// Close connection gracefully
 	if c.conn != nil {
-		_ = c.conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		c.conn.Close()
+		_ = c.conn.WriteMessage(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		)
+		_ = c.conn.Close()
 	}
 
 	c.wg.Wait()
