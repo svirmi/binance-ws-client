@@ -1,0 +1,33 @@
+2025/12/01 19:10:49.452120 ETHUSDT | Bid: 2733.31/8.103 | Ask: 2733.32/53.014 | 19:10:46.775
+2025/12/01 19:10:49.452142 XRPUSDT | Bid: 1.9931/7107.3 | Ask: 1.9932/59939.1 | 19:10:46.775
+2025/12/01 19:10:49.452165 XRPUSDT | Bid: 1.9931/7104.7 | Ask: 1.9932/59939.1 | 19:10:46.775
+2025/12/01 19:10:49.452188 SOLUSDT | Bid: 123.8500/1196.21 | Ask: 123.8600/250.58 | 19:10:46.775
+2025/12/01 19:10:49.452210 BNBUSDT | Bid: 812.830/17.62 | Ask: 812.840/5.84 | 19:10:46.776
+2025/12/01 19:10:49.452234 BTCUSDT | Bid: 84650.00/6.105 | Ask: 84650.10/7.821 | 19:10:46.776
+2025/12/01 19:10:49.452255 BTCUSDT | Bid: 84650.00/6.103 | Ask: 84650.10/7.821 | 19:10:46.776
+2025/12/01 19:10:49.452276 ETHUSDT | Bid: 2733.31/8.103 | Ask: 2733.32/53.043 | 19:10:46.776
+2025/12/01 19:10:49.452298 XRPUSDT | Bid: 1.9931/7104.7 | Ask: 1.9932/59384.1 | 19:10:46.776
+2025/12/01 19:10:49.452317 ETHUSDT | Bid: 2733.31/8.092 | Ask: 2733.32/53.043 | 19:10:46.777
+2025/12/01 19:10:49.452340 ETHUSDT | Bid: 2733.31/8.084 | Ask: 2733.32/53.043 | 19:10:46.777
+2025/12/01 19:10:49.452362 ETHUSDT | Bid: 2733.31/8.083 | Ask: 2733.32/53.043 | 19:10:46.777
+2025/12/01 19:10:49.452383 ETHUSDT | Bid: 2733.31/8.084 | Ask: 2733.32/53.043 | 19:10:46.777
+2025/12/01 19:10:49.452404 ETHUSDT | Bid: 2733.31/2.284 | Ask: 2733.32/53.043 | 19:10:46.777
+2025/12/01 19:10:49.452470 Received error from Binance: map[code:2 msg:Invalid request: missing field `method`]
+2025/12/01 19:10:49.452595 WebSocket read error: websocket: close 1008 (policy violation): Invalid request
+2025/12/01 19:10:49.452612 Attempting to reconnect...
+2025/12/01 19:10:50.452689 Reconnection attempt 1
+2025/12/01 19:10:50.453126 Starting Binance Futures WebSocket client for 10 symbols
+2025/12/01 19:10:51.283059 Connected and subscribed successfully
+2025/12/01 19:10:51.283107 Reconnected successfully
+2025/12/01 19:10:51.283198 Attempting to reconnect...
+2025/12/01 19:10:52.284059 Reconnection attempt 1
+2025/12/01 19:10:52.284129 Starting Binance Futures WebSocket client for 10 symbols
+2025/12/01 19:10:53.132710 Connected and subscribed successfully
+2025/12/01 19:10:53.132758 Reconnected successfully
+2025/12/01 19:10:53.133025 Attempting to reconnect...
+2025/12/01 19:10:54.133269 Reconnection attempt 1
+2025/12/01 19:10:54.133332 Starting Binance Futures WebSocket client for 10 symbols
+2025/12/01 19:10:54.970114 Connected and subscribed successfully
+2025/12/01 19:10:54.970143 Reconnected successfully
+2025/12/01 19:10:54.970291 Attempting to reconnect...
+2025/12/01 19:10:55.970434 Reconnection attempt 1
