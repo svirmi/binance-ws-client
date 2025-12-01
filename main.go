@@ -32,14 +32,15 @@ type BinanceFuturesWebSocketClient struct {
 
 // BookTickerData represents the orderbook level 1 data from Binance
 type BookTickerData struct {
-	UpdateID int64  `json:"u"` // Order book updateId
-	Symbol   string `json:"s"` // Symbol
-	BidPrice string `json:"b"` // Best bid price
-	BidQty   string `json:"B"` // Best bid quantity
-	AskPrice string `json:"a"` // Best ask price
-	AskQty   string `json:"A"` // Best ask quantity
-	EventTs  int64  `json:"E"` // Event time
-	TransTs  int64  `json:"T"` // Transaction time
+	EventType string `json:"e"` // Event type (should be "bookTicker")
+	UpdateID  int64  `json:"u"` // Order book updateId
+	Symbol    string `json:"s"` // Symbol
+	BidPrice  string `json:"b"` // Best bid price
+	BidQty    string `json:"B"` // Best bid quantity
+	AskPrice  string `json:"a"` // Best ask price
+	AskQty    string `json:"A"` // Best ask quantity
+	EventTs   int64  `json:"E"` // Event time
+	TransTs   int64  `json:"T"` // Transaction time
 }
 
 // NewBinanceFuturesWebSocketClient creates a new client
@@ -140,40 +141,22 @@ func (c *BinanceFuturesWebSocketClient) readMessages() {
 
 // processMessage handles incoming WebSocket messages
 func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
-	// Check if it's a control message first
-	var controlMsg map[string]interface{}
-	if err := json.Unmarshal(data, &controlMsg); err == nil {
-		if _, ok := controlMsg["result"]; ok {
-			// Subscription confirmation, ignore
-			return
-		}
-		if errMsg, ok := controlMsg["error"]; ok {
-			log.Printf("Received error from Binance: %v", errMsg)
-			return
-		}
-		if ping, ok := controlMsg["ping"]; ok {
-			// Respond to ping
-			pongMsg := map[string]interface{}{
-				"pong": ping,
-			}
-			if err := c.conn.WriteJSON(pongMsg); err != nil {
-				log.Printf("Failed to send pong: %v", err)
-			}
-			return
-		}
+	// Skip ping/pong messages
+	if bytes.Contains(data, []byte(`"ping"`)) || bytes.Contains(data, []byte(`"pong"`)) {
+		return
 	}
 
-	// Try to parse as book ticker event
+	// Try to parse as book ticker event first (direct format)
 	var bookTicker BookTickerData
 	if err := json.Unmarshal(data, &bookTicker); err == nil {
-		// Check if we have all required fields
-		if bookTicker.Symbol != "" && bookTicker.BidPrice != "" && bookTicker.AskPrice != "" {
+		// Check if it's a bookTicker event and has required fields
+		if bookTicker.EventType == "bookTicker" && bookTicker.Symbol != "" && bookTicker.BidPrice != "" && bookTicker.AskPrice != "" {
 			c.logBookTicker(bookTicker)
 			return
 		}
 	}
 
-	// Try combined stream format
+	// Try combined stream format (stream wrapper)
 	var combinedMsg struct {
 		Stream string          `json:"stream"`
 		Data   json.RawMessage `json:"data"`
@@ -189,9 +172,23 @@ func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
 		return
 	}
 
-	// Log unhandled messages for debugging (only if they're not empty/heartbeats)
-	if len(data) > 10 && !bytes.Contains(data, []byte("ping")) && !bytes.Contains(data, []byte("pong")) {
-		log.Printf("Unhandled message: %s", string(data))
+	// Check if it's a control message (subscription response, error)
+	var controlMsg map[string]interface{}
+	if err := json.Unmarshal(data, &controlMsg); err == nil {
+		if _, ok := controlMsg["result"]; ok {
+			// Subscription confirmation, ignore
+			return
+		}
+		if _, ok := controlMsg["error"]; ok {
+			log.Printf("Received error from Binance: %v", controlMsg["error"])
+			return
+		}
+	}
+
+	// Log unhandled messages for debugging (skip empty messages)
+	if len(data) > 10 {
+		// Try to see what the message looks like
+		log.Printf("DEBUG - Unhandled message structure: %s", string(data))
 	}
 }
 
