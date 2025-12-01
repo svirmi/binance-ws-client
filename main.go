@@ -55,6 +55,18 @@ type Message struct {
 	Received time.Time       `json:"received"`
 }
 
+// BookTickerEvent represents orderbook level1 (best bid/ask) from Binance
+type BookTickerEvent struct {
+	UpdateID  int64  `json:"u"`           // Order book updateId
+	Symbol    string `json:"s"`           // Symbol
+	BidPrice  string `json:"b"`           // Best bid price
+	BidQty    string `json:"B"`           // Best bid quantity
+	AskPrice  string `json:"a"`           // Best ask price
+	AskQty    string `json:"A"`           // Best ask quantity
+	Timestamp int64  `json:"E,omitempty"` // Event time (for combined streams)
+	EventTime int64  `json:"T,omitempty"` // Transaction time (for combined streams)
+}
+
 // WebSocketClient manages a single WebSocket connection
 type WebSocketClient struct {
 	url           string
@@ -83,6 +95,7 @@ type ClientStats struct {
 	reconnects       atomic.Int64
 	lastConnected    atomic.Value // time.Time
 	lastError        atomic.Value // string (error message)
+	bookTickers      atomic.Int64
 }
 
 // NewWebSocketClient creates a new WebSocket client
@@ -124,6 +137,7 @@ func (c *WebSocketClient) Stats() map[string]interface{} {
 		"messages_received": c.stats.messagesReceived.Load(),
 		"connection_errors": c.stats.connectionErrors.Load(),
 		"reconnects":        c.stats.reconnects.Load(),
+		"book_tickers":      c.stats.bookTickers.Load(),
 		"last_connected":    lastConnTime,
 		"last_error":        errMsg,
 		"subscriptions":     len(c.subscriptions),
@@ -136,13 +150,11 @@ func (c *WebSocketClient) Subscribe(streams ...string) error {
 	defer c.mu.Unlock()
 
 	for _, stream := range streams {
-		if !strings.Contains(stream, "@") || len(strings.Split(stream, "@")) != 2 {
-			return fmt.Errorf("invalid stream format: %s", stream)
-		}
+		// Remove validation - let Binance validate the streams
 		c.subscriptions[strings.ToLower(stream)] = struct{}{}
 	}
 
-	log.Printf("[%s] Subscribed to %d streams", c.clientID, len(streams))
+	log.Printf("[%s] Subscribed to %d streams: %v", c.clientID, len(streams), streams)
 
 	if c.isConnected.Load() {
 		if conn := c.getConnection(); conn != nil {
@@ -391,24 +403,10 @@ func (c *WebSocketClient) readMessages() error {
 
 // parseMessage parses incoming messages and extracts stream information
 func (c *WebSocketClient) parseMessage(data []byte) Message {
-	// Try combined stream message first
-	var combinedMsg struct {
-		Stream string          `json:"stream"`
-		Data   json.RawMessage `json:"data"`
-	}
-
-	if err := json.Unmarshal(data, &combinedMsg); err == nil && combinedMsg.Stream != "" {
-		return Message{
-			ClientID: c.clientID,
-			Stream:   combinedMsg.Stream,
-			Data:     combinedMsg.Data,
-			Received: time.Now().UTC(),
-		}
-	}
-
-	// Try raw event
+	// Try raw event first - !bookTicker sends raw events without stream wrapper
 	var rawEvent map[string]interface{}
 	if err := json.Unmarshal(data, &rawEvent); err == nil {
+		// Check if this is a subscription result/error
 		if _, hasResult := rawEvent["result"]; hasResult {
 			return Message{
 				ClientID: c.clientID,
@@ -427,24 +425,15 @@ func (c *WebSocketClient) parseMessage(data []byte) Message {
 			}
 		}
 
-		if eventType, ok := rawEvent["e"].(string); ok {
-			if symbol, ok := rawEvent["s"].(string); ok {
-				var stream string
-				switch eventType {
-				case "trade":
-					stream = strings.ToLower(symbol) + "@trade"
-				case "kline":
-					if k, ok := rawEvent["k"].(map[string]interface{}); ok {
-						if interval, ok := k["i"].(string); ok {
-							stream = strings.ToLower(symbol) + "@kline_" + interval
-						}
-					}
-				}
-
-				if stream != "" {
+		// Check if this is a bookTicker event (has symbol, bid price, and ask price)
+		if symbol, ok := rawEvent["s"].(string); ok && symbol != "" {
+			if _, hasBid := rawEvent["b"]; hasBid {
+				if _, hasAsk := rawEvent["a"]; hasAsk {
+					// This is a bookTicker event from !bookTicker combined stream
+					log.Printf("[%s] Received book ticker for: %s", c.clientID, symbol)
 					return Message{
 						ClientID: c.clientID,
-						Stream:   stream,
+						Stream:   "!bookTicker",
 						Data:     data,
 						Received: time.Now().UTC(),
 					}
@@ -453,6 +442,8 @@ func (c *WebSocketClient) parseMessage(data []byte) Message {
 		}
 	}
 
+	// If we can't parse it, still return a message for debugging
+	log.Printf("[%s] Could not parse message: %s", c.clientID, string(data))
 	return Message{
 		ClientID: c.clientID,
 		Stream:   "",
@@ -500,8 +491,8 @@ func (c *WebSocketClient) Shutdown() {
 	c.wg.Wait()
 	close(c.messageChan)
 	stats := c.Stats()
-	log.Printf("[%s] Shutdown complete. Stats: messages=%v, errors=%v",
-		c.clientID, stats["messages_received"], stats["connection_errors"])
+	log.Printf("[%s] Shutdown complete. Stats: messages=%v, bookTickers=%v",
+		c.clientID, stats["messages_received"], stats["book_tickers"])
 }
 
 // StreamManager manages multiple WebSocket connections
@@ -517,9 +508,10 @@ type StreamManager struct {
 
 // StreamManagerStats holds statistics for the stream manager
 type StreamManagerStats struct {
-	totalMessages atomic.Int64
-	totalClients  atomic.Int64
-	startTime     time.Time
+	totalMessages    atomic.Int64
+	totalClients     atomic.Int64
+	totalBookTickers atomic.Int64
+	startTime        time.Time
 }
 
 // NewStreamManager creates a new stream manager
@@ -545,102 +537,115 @@ func (sm *StreamManager) createMessageHandler() func(Message) {
 			// Log control messages (subscription responses, errors, etc.)
 			var data map[string]interface{}
 			if err := json.Unmarshal(msg.Data, &data); err == nil {
-				if result, ok := data["result"]; ok {
-					log.Printf("[%s] Control: %v", msg.ClientID, result)
+				if _, hasResult := data["result"]; hasResult {
+					// Log subscription confirmation
+					log.Printf("[%s] Subscription confirmed", msg.ClientID)
 				} else if errMsg, ok := data["error"]; ok {
 					log.Printf("[%s] Error: %v", msg.ClientID, errMsg)
 				} else {
+					// Debug: log unknown control messages
 					log.Printf("[%s] Unknown control message: %s", msg.ClientID, string(msg.Data))
 				}
 			}
 			return
 		}
 
-		// Log data messages
-		log.Printf("[%s] Stream: %s, Data: %s, Received: %s",
-			msg.ClientID, msg.Stream, string(msg.Data), msg.Received.Format(time.RFC3339Nano))
+		// Parse and log book ticker messages
+		if msg.Stream == "!bookTicker" {
+			sm.handleBookTickerMessage(msg)
+		} else {
+			// Generic log for other stream types
+			log.Printf("[%s] Unknown stream type: %s, Data: %s",
+				msg.ClientID, msg.Stream, string(msg.Data))
+		}
 	}
+}
+
+// handleBookTickerMessage processes book ticker messages
+func (sm *StreamManager) handleBookTickerMessage(msg Message) {
+	var ticker BookTickerEvent
+
+	// Parse the book ticker event
+	if err := json.Unmarshal(msg.Data, &ticker); err != nil {
+		log.Printf("[%s] BookTicker unmarshal error: %v, Data: %s",
+			msg.ClientID, err, string(msg.Data))
+		return
+	}
+
+	// Validate we have required fields
+	if ticker.Symbol == "" || ticker.BidPrice == "" || ticker.AskPrice == "" {
+		log.Printf("[%s] Invalid book ticker data: %+v", msg.ClientID, ticker)
+		return
+	}
+
+	sm.stats.totalBookTickers.Add(1)
+
+	// Update client stats if available
+	if client := sm.findClient(msg.ClientID); client != nil {
+		client.stats.bookTickers.Add(1)
+	}
+
+	// Use timestamp if available, otherwise use event time or received time
+	var timestamp int64
+	if ticker.Timestamp > 0 {
+		timestamp = ticker.Timestamp
+	} else if ticker.EventTime > 0 {
+		timestamp = ticker.EventTime
+	}
+
+	var timeStr string
+	if timestamp > 0 {
+		timeStr = time.Unix(0, timestamp*int64(time.Millisecond)).UTC().Format("15:04:05.000")
+	} else {
+		timeStr = msg.Received.Format("15:04:05.000")
+	}
+
+	log.Printf("[%s] BOOK: %s Bid=%s/%s Ask=%s/%s Time=%s",
+		msg.ClientID, ticker.Symbol, ticker.BidPrice, ticker.BidQty,
+		ticker.AskPrice, ticker.AskQty, timeStr)
+}
+
+// findClient finds a client by ID
+func (sm *StreamManager) findClient(clientID string) *WebSocketClient {
+	for _, client := range sm.clients {
+		if client.clientID == clientID {
+			return client
+		}
+	}
+	return nil
 }
 
 // Start initializes and starts all WebSocket connections
 func (sm *StreamManager) Start() error {
 	log.Printf("Starting stream manager for %d symbols", len(sm.symbols))
 
-	// Calculate connections needed
-	connectionsNeeded := (len(sm.symbols)*2 + sm.config.MaxStreamsPerConnection - 1) / sm.config.MaxStreamsPerConnection
-	if connectionsNeeded < 1 {
-		connectionsNeeded = 1
-	}
-
-	log.Printf("Creating %d WebSocket connections", connectionsNeeded)
-
 	handler := sm.createMessageHandler()
 
-	// Prepare stream lists
-	spotStreams := make([][]string, connectionsNeeded)
-	futuresStreams := make([][]string, connectionsNeeded)
+	// Create futures client for combined !bookTicker stream
+	futuresBookTickerClient := NewWebSocketClient(
+		"futures-bookticker",
+		"wss://fstream.binance.com/stream",
+		sm.config,
+		handler,
+	)
 
-	// Distribute streams across connections
-	for i, symbol := range sm.symbols {
-		connIndex := i % connectionsNeeded
-		stream := strings.ToLower(symbol) + "@trade"
-		spotStreams[connIndex] = append(spotStreams[connIndex], stream)
-		futuresStreams[connIndex] = append(futuresStreams[connIndex], stream)
-
-		// Also subscribe to 1m klines
-		klineStream := strings.ToLower(symbol) + "@kline_1m"
-		spotStreams[connIndex] = append(spotStreams[connIndex], klineStream)
-		futuresStreams[connIndex] = append(futuresStreams[connIndex], klineStream)
-	}
-
-	// Create and start clients
-	for i := 0; i < connectionsNeeded; i++ {
-		if len(spotStreams[i]) > 0 {
-			spotClient := NewWebSocketClient(
-				fmt.Sprintf("spot-%d", i),
-				"wss://stream.binance.com:9443/stream",
-				sm.config,
-				handler,
-			)
-
-			if err := spotClient.Subscribe(spotStreams[i]...); err != nil {
-				log.Printf("Failed to subscribe spot client %d: %v", i, err)
-				continue
-			}
-
-			if err := spotClient.Start(); err != nil {
-				log.Printf("Failed to start spot client %d: %v", i, err)
-				continue
-			}
-
-			sm.clients = append(sm.clients, spotClient)
-			sm.stats.totalClients.Add(1)
-		}
-
-		if len(futuresStreams[i]) > 0 {
-			futuresClient := NewWebSocketClient(
-				fmt.Sprintf("futures-%d", i),
-				"wss://fstream.binance.com/stream",
-				sm.config,
-				handler,
-			)
-
-			if err := futuresClient.Subscribe(futuresStreams[i]...); err != nil {
-				log.Printf("Failed to subscribe futures client %d: %v", i, err)
-				continue
-			}
-
-			if err := futuresClient.Start(); err != nil {
-				log.Printf("Failed to start futures client %d: %v", i, err)
-				continue
-			}
-
-			sm.clients = append(sm.clients, futuresClient)
+	// Subscribe to combined !bookTicker stream
+	if err := futuresBookTickerClient.Subscribe("!bookTicker"); err != nil {
+		log.Printf("Failed to subscribe futures bookTicker client: %v", err)
+	} else {
+		if err := futuresBookTickerClient.Start(); err != nil {
+			log.Printf("Failed to start futures bookTicker client: %v", err)
+		} else {
+			sm.clients = append(sm.clients, futuresBookTickerClient)
 			sm.stats.totalClients.Add(1)
 		}
 	}
 
-	log.Printf("Started %d WebSocket clients", len(sm.clients))
+	log.Printf("Started %d WebSocket client(s)", len(sm.clients))
+
+	if len(sm.clients) == 0 {
+		return errors.New("no WebSocket clients started")
+	}
 
 	// Start statistics reporter
 	sm.wg.Add(1)
@@ -662,19 +667,20 @@ func (sm *StreamManager) reportStats() {
 			return
 		case <-ticker.C:
 			uptime := time.Since(sm.stats.startTime)
-			log.Printf("STATS: Uptime=%v, TotalMessages=%d, ActiveClients=%d",
+			log.Printf("STATS: Uptime=%v, TotalMsgs=%d, BookTickers=%d, ActiveClients=%d",
 				uptime.Round(time.Second),
 				sm.stats.totalMessages.Load(),
+				sm.stats.totalBookTickers.Load(),
 				sm.stats.totalClients.Load())
 
 			// Report per-client stats
 			for _, client := range sm.clients {
 				stats := client.Stats()
 				if connected, _ := stats["connected"].(bool); connected {
-					log.Printf("  Client %s: messages=%v, errors=%v",
+					log.Printf("  Client %s: msgs=%v, bookTickers=%v",
 						stats["client_id"],
 						stats["messages_received"],
-						stats["connection_errors"])
+						stats["book_tickers"])
 				}
 			}
 		}
@@ -689,11 +695,12 @@ func (sm *StreamManager) GetStats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"total_clients":  sm.stats.totalClients.Load(),
-		"total_messages": sm.stats.totalMessages.Load(),
-		"uptime":         time.Since(sm.stats.startTime).String(),
-		"clients":        clientStats,
-		"symbols_count":  len(sm.symbols),
+		"total_clients":     sm.stats.totalClients.Load(),
+		"total_messages":    sm.stats.totalMessages.Load(),
+		"total_booktickers": sm.stats.totalBookTickers.Load(),
+		"uptime":            time.Since(sm.stats.startTime).String(),
+		"clients":           clientStats,
+		"symbols_count":     len(sm.symbols),
 	}
 }
 
@@ -728,7 +735,7 @@ func main() {
 		log.Fatalf("Failed to start stream manager: %v", err)
 	}
 
-	log.Printf("System started: %d clients, %d workers",
+	log.Printf("System started: %d client(s), %d workers",
 		len(streamManager.clients), config.WorkerPoolSize)
 
 	// Graceful shutdown
