@@ -92,7 +92,7 @@ func (c *BinanceFuturesWebSocketClient) run() {
 		// --- Connect ---
 		conn, err := c.connect()
 		if err != nil {
-			log.Printf("Failed to connect: %v", err)
+			log.Printf("[run] Failed to connect: %v", err)
 			time.Sleep(backoff)
 			backoff *= 2
 			if backoff > maxBackoff {
@@ -104,7 +104,7 @@ func (c *BinanceFuturesWebSocketClient) run() {
 		// Reset backoff on successful connect
 		backoff = time.Second
 		c.conn = conn
-		log.Println("Connected and subscribed successfully")
+		log.Println("[run] Connected and subscribed successfully")
 
 		// --- Per-connection context ---
 		connCtx, connCancel := context.WithCancel(c.ctx)
@@ -112,10 +112,10 @@ func (c *BinanceFuturesWebSocketClient) run() {
 		// Start loops tied to this connection
 		var connWG sync.WaitGroup
 		connWG.Add(2)
-		go c.readLoop(connCtx, &connWG)
-		go c.heartbeatLoop(connCtx, &connWG)
+		go c.readLoop(connCtx, connCancel, &connWG)
+		go c.heartbeatLoop(connCtx, connCancel, &connWG)
 
-		// Wait until both loops finish
+		// Wait until both loops finish (they call connCancel on error)
 		connWG.Wait()
 		connCancel()
 
@@ -129,26 +129,26 @@ func (c *BinanceFuturesWebSocketClient) run() {
 			return
 		}
 
-		log.Println("Attempting to reconnect...")
+		log.Println("[run] Attempting to reconnect...")
 	}
 }
 
 // connect dials Binance, sets handlers, and subscribes to bookTicker streams.
 func (c *BinanceFuturesWebSocketClient) connect() (*websocket.Conn, error) {
-	log.Printf("Starting Binance Futures WebSocket client for %d symbols", len(c.symbols))
+	log.Printf("[connect] Starting Binance Futures WebSocket client for %d symbols", len(c.symbols))
 
 	conn, _, err := websocket.DefaultDialer.Dial(c.url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Binance: %w", err)
 	}
 
-	readTimeout := 10 * time.Second
+	readTimeout := 90 * time.Second
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
 
 	conn.SetPongHandler(func(appData string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
-		// You can log if you want, but it's often noisy:
-		// log.Printf("Received pong: %s", appData)
+		// Uncomment if you want to see pongs:
+		// log.Printf("[pong] %s", appData)
 		return nil
 	})
 
@@ -156,7 +156,7 @@ func (c *BinanceFuturesWebSocketClient) connect() (*websocket.Conn, error) {
 		deadline := time.Now().Add(5 * time.Second)
 		err := conn.WriteControl(websocket.PongMessage, []byte(appData), deadline)
 		if err != nil {
-			log.Printf("Failed to send pong in PingHandler: %v", err)
+			log.Printf("[ping-handler] Failed to send pong: %v", err)
 		} else {
 			_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 		}
@@ -185,7 +185,7 @@ func (c *BinanceFuturesWebSocketClient) connect() (*websocket.Conn, error) {
 }
 
 // readLoop reads and processes incoming messages for a single connection.
-func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connWG *sync.WaitGroup) {
+func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connCancel context.CancelFunc, connWG *sync.WaitGroup) {
 	defer connWG.Done()
 
 	for {
@@ -204,11 +204,12 @@ func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connWG
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("WebSocket read error: %v", err)
+				log.Printf("[readLoop] WebSocket read error: %v", err)
 			} else {
-				log.Printf("WebSocket read error (non-unexpected): %v", err)
+				log.Printf("[readLoop] WebSocket read error (non-unexpected): %v", err)
 			}
-			// Returning will cause connWG.Wait() to finish, which triggers reconnect in run().
+			// Trigger reconnect by canceling this connection context.
+			connCancel()
 			return
 		}
 
@@ -218,7 +219,7 @@ func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connWG
 }
 
 // heartbeatLoop sends periodic pings to keep connection alive.
-func (c *BinanceFuturesWebSocketClient) heartbeatLoop(connCtx context.Context, connWG *sync.WaitGroup) {
+func (c *BinanceFuturesWebSocketClient) heartbeatLoop(connCtx context.Context, connCancel context.CancelFunc, connWG *sync.WaitGroup) {
 	defer connWG.Done()
 
 	// Binance recommends ping/pong every 3 minutes if idle
@@ -237,8 +238,9 @@ func (c *BinanceFuturesWebSocketClient) heartbeatLoop(connCtx context.Context, c
 			deadline := time.Now().Add(5 * time.Second)
 			payload := []byte(fmt.Sprintf("%d", time.Now().UnixMilli()))
 			if err := c.conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
-				log.Printf("Failed to send ping control frame: %v", err)
-				// Returning will end this loop; run() detects both loops finished and reconnects.
+				log.Printf("[heartbeatLoop] Failed to send ping control frame: %v", err)
+				// Trigger reconnect
+				connCancel()
 				return
 			}
 		}
@@ -281,14 +283,14 @@ func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
 			return
 		}
 		if errVal, ok := controlMsg["error"]; ok {
-			log.Printf("Received error from Binance: %v", errVal)
+			log.Printf("[processMessage] Received error from Binance: %v", errVal)
 			return
 		}
 	}
 
 	// Log unhandled messages for debugging (skip very small ones)
 	if len(data) > 10 {
-		log.Printf("DEBUG - Unhandled message structure: %s", string(data))
+		log.Printf("[processMessage] DEBUG - Unhandled message structure: %s", string(data))
 	}
 }
 
