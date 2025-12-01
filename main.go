@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -74,6 +73,33 @@ func (c *BinanceFuturesWebSocketClient) Start() error {
 	}
 	c.conn = conn
 
+	// Set initial read deadline and handlers
+	// Choose a generous read timeout; we'll extend it in the pong handler.
+	readTimeout := 90 * time.Second
+	c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+
+	// Pong handler extends deadline
+	c.conn.SetPongHandler(func(appData string) error {
+		// extend read deadline on every pong
+		_ = c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+		log.Printf("Received pong (extend read deadline): %s", appData)
+		return nil
+	})
+
+	// Ping handler: respond with a pong control frame
+	c.conn.SetPingHandler(func(appData string) error {
+		// write pong control frame in reply to server ping
+		deadline := time.Now().Add(5 * time.Second)
+		err := c.conn.WriteControl(websocket.PongMessage, []byte(appData), deadline)
+		if err != nil {
+			log.Printf("Failed to send pong in PingHandler: %v", err)
+		} else {
+			// also extend read deadline locally to avoid read timeout
+			_ = c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+		}
+		return nil
+	})
+
 	// Subscribe to bookTicker streams
 	params := make([]string, 0, len(c.symbols))
 	for _, symbol := range c.symbols {
@@ -120,15 +146,17 @@ func (c *BinanceFuturesWebSocketClient) readMessages() {
 		case <-c.ctx.Done():
 			return
 		default:
-			// Set read timeout
-			c.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			// Set a read deadline - pong handler will extend this
+			c.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
 			_, message, err := c.conn.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					log.Printf("WebSocket read error: %v", err)
+				} else {
+					log.Printf("WebSocket read error (non-unexpected): %v", err)
 				}
-				// Try to reconnect
+				// Try to reconnect (only if still running)
 				c.reconnect()
 				return
 			}
@@ -141,10 +169,8 @@ func (c *BinanceFuturesWebSocketClient) readMessages() {
 
 // processMessage handles incoming WebSocket messages
 func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
-	// Skip ping/pong messages
-	if bytes.Contains(data, []byte(`"ping"`)) || bytes.Contains(data, []byte(`"pong"`)) {
-		return
-	}
+	// Skip ping/pong control frames are handled at control level; websocket.ReadMessage returns only application messages.
+	// However some server control messages might be in JSON "result" etc — still handled below.
 
 	// Try to parse as book ticker event first (direct format)
 	var bookTicker BookTickerData
@@ -263,7 +289,9 @@ func (c *BinanceFuturesWebSocketClient) reconnect() {
 func (c *BinanceFuturesWebSocketClient) heartbeatMonitor() {
 	defer c.wg.Done()
 
-	ticker := time.NewTicker(30 * time.Second)
+	// Binance recommends ping/pong every 3 minutes if idle; choose interval < read timeout
+	interval := 3 * time.Minute
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for c.isRunning.Load() {
@@ -272,12 +300,14 @@ func (c *BinanceFuturesWebSocketClient) heartbeatMonitor() {
 			return
 		case <-ticker.C:
 			if c.conn != nil {
-				// Send ping
-				pingMsg := map[string]interface{}{
-					"ping": time.Now().UnixMilli(),
-				}
-				if err := c.conn.WriteJSON(pingMsg); err != nil {
-					log.Printf("Failed to send ping: %v", err)
+				// Send a WebSocket Ping control frame (NOT a JSON app message)
+				deadline := time.Now().Add(5 * time.Second)
+				payload := []byte(fmt.Sprintf("%d", time.Now().UnixMilli()))
+				if err := c.conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
+					log.Printf("Failed to send ping control frame: %v", err)
+					// Consider triggering reconnect on write failure
+				} else {
+					log.Println("Sent ping control frame")
 				}
 			}
 		}
@@ -293,7 +323,7 @@ func (c *BinanceFuturesWebSocketClient) Stop() {
 
 	// Close connection gracefully
 	if c.conn != nil {
-		c.conn.WriteMessage(websocket.CloseMessage,
+		_ = c.conn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 		c.conn.Close()
 	}
