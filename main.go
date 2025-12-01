@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,10 +20,9 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	_ "github.com/lib/pq" // PostgreSQL driver for QuestDB
 )
 
-// Configuration for scalable processing
+// Configuration for WebSocket connections
 type Config struct {
 	// WebSocket settings
 	MaxStreamsPerConnection int           `json:"max_streams_per_connection"`
@@ -34,18 +31,8 @@ type Config struct {
 
 	// Processing settings
 	WorkerPoolSize    int           `json:"worker_pool_size"`
-	BatchSize         int           `json:"batch_size"`
-	BatchTimeout      time.Duration `json:"batch_timeout"`
 	ChannelBufferSize int           `json:"channel_buffer_size"`
-
-	// QuestDB settings
-	QuestDBHost      string        `json:"questdb_host"`
-	QuestDBPort      int           `json:"questdb_port"`
-	QuestDBUser      string        `json:"questdb_user"`
-	QuestDBPass      string        `json:"questdb_pass"`
-	QuestDBName      string        `json:"questdb_name"`
-	MaxDBConnections int           `json:"max_db_connections"`
-	DBTimeout        time.Duration `json:"db_timeout"`
+	ReadTimeout       time.Duration `json:"read_timeout"`
 }
 
 // DefaultConfig returns a production-ready configuration
@@ -55,16 +42,8 @@ func DefaultConfig() *Config {
 		ReconnectWait:           2 * time.Second,
 		MaxReconnectWait:        30 * time.Second,
 		WorkerPoolSize:          runtime.NumCPU() * 2,
-		BatchSize:               1000, // Larger batches for QuestDB
-		BatchTimeout:            1 * time.Second,
 		ChannelBufferSize:       10000,
-		QuestDBHost:             "localhost",
-		QuestDBPort:             8812, // QuestDB PostgreSQL port
-		QuestDBUser:             "admin",
-		QuestDBPass:             "quest",
-		QuestDBName:             "main",
-		MaxDBConnections:        20,
-		DBTimeout:               5 * time.Second,
+		ReadTimeout:             120 * time.Second,
 	}
 }
 
@@ -73,72 +52,7 @@ type Message struct {
 	ClientID string          `json:"client_id"`
 	Stream   string          `json:"stream"`
 	Data     json.RawMessage `json:"data"`
-}
-
-// TradeEvent represents a trade event from Binance
-type TradeEvent struct {
-	EventType string `json:"e"`
-	EventTime int64  `json:"E"`
-	Symbol    string `json:"s"`
-	TradeID   int64  `json:"t"`
-	Price     string `json:"p"`
-	Quantity  string `json:"q"`
-	TradeTime int64  `json:"T"`
-	IsMaker   bool   `json:"m"`
-	Ignore    bool   `json:"M"`
-}
-
-// KlineEvent represents a kline/candlestick event from Binance
-type KlineEvent struct {
-	EventType string `json:"e"`
-	EventTime int64  `json:"E"`
-	Symbol    string `json:"s"`
-	Kline     struct {
-		StartTime           int64  `json:"t"`
-		CloseTime           int64  `json:"T"`
-		Symbol              string `json:"s"`
-		Interval            string `json:"i"`
-		FirstTradeID        int64  `json:"f"`
-		LastTradeID         int64  `json:"L"`
-		Open                string `json:"o"`
-		Close               string `json:"c"`
-		High                string `json:"h"`
-		Low                 string `json:"l"`
-		Volume              string `json:"v"`
-		NumberOfTrades      int64  `json:"n"`
-		IsClosed            bool   `json:"x"`
-		QuoteVolume         string `json:"q"`
-		TakerBuyBaseVolume  string `json:"V"`
-		TakerBuyQuoteVolume string `json:"Q"`
-		Ignore              string `json:"B"`
-	} `json:"k"`
-}
-
-// TradeData represents processed trade information for QuestDB
-type TradeData struct {
-	ClientID     string
-	Symbol       string
-	Price        float64
-	Quantity     float64
-	TradeTime    time.Time
-	IsBuyerMaker bool
-	ProcessedAt  time.Time
-}
-
-// KlineData represents processed kline information for QuestDB
-type KlineData struct {
-	ClientID    string
-	Symbol      string
-	Interval    string
-	OpenTime    time.Time
-	CloseTime   time.Time
-	Open        float64
-	High        float64
-	Low         float64
-	Close       float64
-	Volume      float64
-	IsClosed    bool
-	ProcessedAt time.Time
+	Received time.Time       `json:"received"`
 }
 
 // WebSocketClient manages a single WebSocket connection
@@ -152,34 +66,67 @@ type WebSocketClient struct {
 	maxWait       time.Duration
 	ctx           context.Context
 	cancel        context.CancelFunc
-	mu            sync.Mutex
+	mu            sync.RWMutex
 	wg            sync.WaitGroup
-	isConnected   bool
+	isConnected   atomic.Bool
 	subscriptions map[string]struct{}
 	workerCount   int
 	clientID      string
-	isFutures     bool
+	config        *Config
+	stats         *ClientStats
+}
+
+// ClientStats holds connection statistics
+type ClientStats struct {
+	messagesReceived atomic.Int64
+	connectionErrors atomic.Int64
+	reconnects       atomic.Int64
+	lastConnected    atomic.Value // time.Time
+	lastError        atomic.Value // string (error message)
 }
 
 // NewWebSocketClient creates a new WebSocket client
-func NewWebSocketClient(clientID, url string, handler func(Message), workerCount int) *WebSocketClient {
+func NewWebSocketClient(clientID, url string, config *Config, handler func(Message)) *WebSocketClient {
 	ctx, cancel := context.WithCancel(context.Background())
-	isFutures := strings.Contains(url, "fstream")
+	stats := &ClientStats{}
+	stats.lastConnected.Store(time.Time{})
+	stats.lastError.Store("") // Store empty string instead of nil
 
 	return &WebSocketClient{
 		clientID:      clientID,
 		url:           url,
-		messageChan:   make(chan Message, 5000),
+		config:        config,
+		messageChan:   make(chan Message, config.ChannelBufferSize),
 		handler:       handler,
 		reconnect:     true,
-		reconnectWait: 2 * time.Second,
-		maxWait:       30 * time.Second,
+		reconnectWait: config.ReconnectWait,
+		maxWait:       config.MaxReconnectWait,
 		ctx:           ctx,
 		cancel:        cancel,
-		isConnected:   false,
+		isConnected:   atomic.Bool{},
 		subscriptions: make(map[string]struct{}),
-		workerCount:   workerCount,
-		isFutures:     isFutures,
+		workerCount:   config.WorkerPoolSize,
+		stats:         stats,
+	}
+}
+
+// Stats returns current client statistics
+func (c *WebSocketClient) Stats() map[string]interface{} {
+	lastErr := c.stats.lastError.Load()
+	errMsg, _ := lastErr.(string)
+
+	lastConn := c.stats.lastConnected.Load()
+	lastConnTime, _ := lastConn.(time.Time)
+
+	return map[string]interface{}{
+		"client_id":         c.clientID,
+		"connected":         c.isConnected.Load(),
+		"messages_received": c.stats.messagesReceived.Load(),
+		"connection_errors": c.stats.connectionErrors.Load(),
+		"reconnects":        c.stats.reconnects.Load(),
+		"last_connected":    lastConnTime,
+		"last_error":        errMsg,
+		"subscriptions":     len(c.subscriptions),
 	}
 }
 
@@ -197,21 +144,39 @@ func (c *WebSocketClient) Subscribe(streams ...string) error {
 
 	log.Printf("[%s] Subscribed to %d streams", c.clientID, len(streams))
 
-	if c.isConnected && c.conn != nil {
-		return c.sendSubscription()
+	if c.isConnected.Load() {
+		if conn := c.getConnection(); conn != nil {
+			return c.sendSubscription(conn)
+		}
 	}
 	return nil
 }
 
-// sendSubscription sends a subscription message to Binance
-func (c *WebSocketClient) sendSubscription() error {
-	if len(c.subscriptions) == 0 {
-		return nil
-	}
+// getConnection safely returns the current connection
+func (c *WebSocketClient) getConnection() *websocket.Conn {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.conn
+}
 
+// setConnection safely sets the current connection
+func (c *WebSocketClient) setConnection(conn *websocket.Conn) {
+	c.mu.Lock()
+	c.conn = conn
+	c.mu.Unlock()
+}
+
+// sendSubscription sends a subscription message to Binance
+func (c *WebSocketClient) sendSubscription(conn *websocket.Conn) error {
+	c.mu.RLock()
 	streams := make([]string, 0, len(c.subscriptions))
 	for stream := range c.subscriptions {
 		streams = append(streams, stream)
+	}
+	c.mu.RUnlock()
+
+	if len(streams) == 0 {
+		return nil
 	}
 
 	subMsg := map[string]interface{}{
@@ -220,22 +185,29 @@ func (c *WebSocketClient) sendSubscription() error {
 		"id":     rand.Intn(1000),
 	}
 
-	return c.conn.WriteJSON(subMsg)
+	c.mu.Lock()
+	err := conn.WriteJSON(subMsg)
+	c.mu.Unlock()
+
+	if err != nil {
+		c.stats.connectionErrors.Add(1)
+		c.stats.lastError.Store(err.Error())
+		return fmt.Errorf("failed to send subscription: %w", err)
+	}
+
+	return nil
 }
 
 // Start connects to the WebSocket and starts processing messages
 func (c *WebSocketClient) Start() error {
 	c.wg.Add(1)
 	go c.run()
-	return c.connect()
+	return nil
 }
 
 // connect establishes a WebSocket connection with reliable DNS resolution
 func (c *WebSocketClient) connect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.isConnected {
+	if c.isConnected.Load() {
 		return nil
 	}
 
@@ -244,7 +216,6 @@ func (c *WebSocketClient) connect() error {
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 2 * time.Second}
-			// Try multiple public DNS servers
 			servers := []string{"8.8.8.8:53", "1.1.1.1:53", "8.8.4.4:53"}
 			for _, server := range servers {
 				conn, err := d.DialContext(ctx, "udp", server)
@@ -276,19 +247,21 @@ func (c *WebSocketClient) connect() error {
 				c.clientID, err, string(body))
 			resp.Body.Close()
 		}
+		c.stats.connectionErrors.Add(1)
+		c.stats.lastError.Store(err.Error())
 		return err
 	}
 
-	c.conn = conn
-	c.isConnected = true
+	c.setConnection(conn)
+	c.isConnected.Store(true)
+	c.stats.lastConnected.Store(time.Now())
+	c.stats.lastError.Store("") // Clear error on successful connection
 	log.Printf("[%s] Connected to %s", c.clientID, c.url)
 
-	c.wg.Add(1)
-	go c.readMessages()
 	c.startWorkers()
 
 	if len(c.subscriptions) > 0 {
-		if err := c.sendSubscription(); err != nil {
+		if err := c.sendSubscription(conn); err != nil {
 			log.Printf("[%s] Failed to send subscription: %v", c.clientID, err)
 		}
 	}
@@ -299,14 +272,14 @@ func (c *WebSocketClient) connect() error {
 // disconnect closes the WebSocket connection
 func (c *WebSocketClient) disconnect() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil
-		c.isConnected = false
-		log.Printf("[%s] Disconnected", c.clientID)
 	}
+	c.mu.Unlock()
+
+	c.isConnected.Store(false)
+	log.Printf("[%s] Disconnected", c.clientID)
 }
 
 // run manages the WebSocket connection lifecycle
@@ -319,9 +292,23 @@ func (c *WebSocketClient) run() {
 			c.disconnect()
 			return
 		default:
-			if c.reconnect {
-				c.reconnectWithBackoff()
-			} else {
+			if err := c.connect(); err != nil {
+				log.Printf("[%s] Connection failed: %v", c.clientID, err)
+				if c.reconnect {
+					c.reconnectWithBackoff()
+					continue
+				}
+				return
+			}
+
+			// Connection successful, start reading messages
+			if err := c.readMessages(); err != nil {
+				log.Printf("[%s] Read messages failed: %v", c.clientID, err)
+				c.disconnect()
+				if c.reconnect {
+					c.reconnectWithBackoff()
+					continue
+				}
 				return
 			}
 		}
@@ -338,59 +325,65 @@ func (c *WebSocketClient) reconnectWithBackoff() {
 		case <-c.ctx.Done():
 			return
 		default:
-			if err := c.connect(); err != nil {
-				attempts++
-				if attempts > 5 {
-					log.Printf("[%s] Multiple reconnection failures, waiting longer", c.clientID)
-					time.Sleep(5 * time.Minute)
-				}
+			c.stats.reconnects.Add(1)
+			log.Printf("[%s] Reconnection attempt %d, waiting %v",
+				c.clientID, attempts+1, wait)
 
-				jitter := time.Duration(rand.Intn(100)) * time.Millisecond
-				log.Printf("[%s] Reconnecting in %v (attempt %d)", c.clientID, wait+jitter, attempts)
-				time.Sleep(wait + jitter)
-
-				wait = wait * 2
-				if wait > c.maxWait {
-					wait = c.maxWait
+			timer := time.NewTimer(wait)
+			select {
+			case <-c.ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
 				}
-			} else {
+				return
+			case <-timer.C:
+				// Timer expired, try to reconnect
 				return
 			}
+
+			// Increase wait time with jitter
+			jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+			wait = wait*2 + jitter
+			if wait > c.maxWait {
+				wait = c.maxWait
+			}
+			attempts++
 		}
 	}
 }
 
 // readMessages reads incoming WebSocket messages
-func (c *WebSocketClient) readMessages() {
-	defer c.wg.Done()
+func (c *WebSocketClient) readMessages() error {
+	conn := c.getConnection()
+	if conn == nil {
+		return errors.New("no connection")
+	}
 
 	for {
 		select {
 		case <-c.ctx.Done():
-			return
+			return nil
 		default:
-			if !c.isConnected {
-				return
-			}
-
-			c.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-			_, message, err := c.conn.ReadMessage()
+			conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
+			_, message, err := conn.ReadMessage()
 			if err != nil {
 				if errors.Is(err, websocket.ErrCloseSent) ||
 					websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					return
+					return nil
 				}
-				log.Printf("[%s] Read error: %v", c.clientID, err)
-				c.disconnect()
-				return
+				return fmt.Errorf("read error: %w", err)
 			}
 
+			c.stats.messagesReceived.Add(1)
 			msg := c.parseMessage(message)
 
 			select {
 			case c.messageChan <- msg:
+				// Message sent to channel successfully
 			case <-time.After(100 * time.Millisecond):
 				log.Printf("[%s] Message channel blocked, dropping message", c.clientID)
+			case <-c.ctx.Done():
+				return nil
 			}
 		}
 	}
@@ -409,6 +402,7 @@ func (c *WebSocketClient) parseMessage(data []byte) Message {
 			ClientID: c.clientID,
 			Stream:   combinedMsg.Stream,
 			Data:     combinedMsg.Data,
+			Received: time.Now().UTC(),
 		}
 	}
 
@@ -416,11 +410,21 @@ func (c *WebSocketClient) parseMessage(data []byte) Message {
 	var rawEvent map[string]interface{}
 	if err := json.Unmarshal(data, &rawEvent); err == nil {
 		if _, hasResult := rawEvent["result"]; hasResult {
-			return Message{ClientID: c.clientID, Stream: "", Data: data}
+			return Message{
+				ClientID: c.clientID,
+				Stream:   "",
+				Data:     data,
+				Received: time.Now().UTC(),
+			}
 		}
 
 		if _, hasError := rawEvent["error"]; hasError {
-			return Message{ClientID: c.clientID, Stream: "", Data: data}
+			return Message{
+				ClientID: c.clientID,
+				Stream:   "",
+				Data:     data,
+				Received: time.Now().UTC(),
+			}
 		}
 
 		if eventType, ok := rawEvent["e"].(string); ok {
@@ -442,6 +446,7 @@ func (c *WebSocketClient) parseMessage(data []byte) Message {
 						ClientID: c.clientID,
 						Stream:   stream,
 						Data:     data,
+						Received: time.Now().UTC(),
 					}
 				}
 			}
@@ -452,6 +457,7 @@ func (c *WebSocketClient) parseMessage(data []byte) Message {
 		ClientID: c.clientID,
 		Stream:   "",
 		Data:     data,
+		Received: time.Now().UTC(),
 	}
 }
 
@@ -470,11 +476,12 @@ func (c *WebSocketClient) startWorkers() {
 					// Handle Binance ping messages
 					if bytes.Contains(msg.Data, []byte(`"ping"`)) {
 						pong := bytes.Replace(msg.Data, []byte(`"ping"`), []byte(`"pong"`), 1)
-						c.mu.Lock()
-						if c.isConnected && c.conn != nil {
-							c.conn.WriteMessage(websocket.TextMessage, pong)
+						conn := c.getConnection()
+						if conn != nil {
+							c.mu.Lock()
+							conn.WriteMessage(websocket.TextMessage, pong)
+							c.mu.Unlock()
 						}
-						c.mu.Unlock()
 						continue
 					}
 
@@ -492,387 +499,66 @@ func (c *WebSocketClient) Shutdown() {
 	c.disconnect()
 	c.wg.Wait()
 	close(c.messageChan)
-}
-
-// DatabaseManager handles all QuestDB operations
-type DatabaseManager struct {
-	db     *sql.DB
-	config *Config
-
-	tradeChan chan *TradeData
-	klineChan chan *KlineData
-
-	tradeBatch []*TradeData
-	klineBatch []*KlineData
-
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	mu     sync.Mutex
-}
-
-// NewDatabaseManager creates a new QuestDB manager
-func NewDatabaseManager(config *Config) (*DatabaseManager, error) {
-	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-		config.QuestDBHost, config.QuestDBPort, config.QuestDBUser, config.QuestDBPass, config.QuestDBName)
-
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to QuestDB: %v", err)
-	}
-
-	db.SetMaxOpenConns(config.MaxDBConnections)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(30 * time.Minute)
-
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping QuestDB: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	dm := &DatabaseManager{
-		db:         db,
-		config:     config,
-		tradeChan:  make(chan *TradeData, config.ChannelBufferSize),
-		klineChan:  make(chan *KlineData, config.ChannelBufferSize),
-		tradeBatch: make([]*TradeData, 0, config.BatchSize),
-		klineBatch: make([]*KlineData, 0, config.BatchSize),
-		ctx:        ctx,
-		cancel:     cancel,
-	}
-
-	if err := dm.initTables(); err != nil {
-		return nil, fmt.Errorf("failed to initialize QuestDB tables: %v", err)
-	}
-
-	// Start background health check
-	go dm.dbHealthCheck()
-
-	return dm, nil
-}
-
-// dbHealthCheck periodically checks database connection
-func (dm *DatabaseManager) dbHealthCheck() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-dm.ctx.Done():
-			return
-		case <-ticker.C:
-			if err := dm.db.Ping(); err != nil {
-				log.Printf("QuestDB connection unhealthy: %v", err)
-			}
-		}
-	}
-}
-
-// initTables creates necessary QuestDB tables
-func (dm *DatabaseManager) initTables() error {
-
-	if _, err := dm.db.Exec("DROP TABLE IF EXISTS trades"); err != nil {
-		return fmt.Errorf("failed to DROP trades table: %v", err)
-	}
-
-	if _, err := dm.db.Exec("DROP TABLE IF EXISTS klines"); err != nil {
-		return fmt.Errorf("failed to DROP klines table: %v", err)
-	}
-
-	// Create trades table with designated timestamp
-	tradeTable := `
-	CREATE TABLE IF NOT EXISTS trades (
-		trade_time TIMESTAMP,
-		client_id SYMBOL,
-		symbol SYMBOL,
-		price DOUBLE,
-		quantity DOUBLE,
-		is_buyer_maker BOOLEAN,
-		processed_at TIMESTAMP
-	) TIMESTAMP(trade_time) PARTITION BY DAY TTL 21 DAY;
-	`
-
-	// Create klines table with designated timestamp
-	klineTable := `
-	CREATE TABLE IF NOT EXISTS klines (
-		open_time TIMESTAMP,
-		client_id SYMBOL,
-		symbol SYMBOL,
-		interval SYMBOL,
-		close_time TIMESTAMP,
-		open_price DOUBLE,
-		high_price DOUBLE,
-		low_price DOUBLE,
-		close_price DOUBLE,
-		volume DOUBLE,
-		is_closed BOOLEAN,
-		processed_at TIMESTAMP
-	) TIMESTAMP(open_time) PARTITION BY DAY TTL 21 DAY;
-	`
-
-	if _, err := dm.db.Exec(tradeTable); err != nil {
-		return fmt.Errorf("failed to create trades table: %v", err)
-	}
-
-	if _, err := dm.db.Exec(klineTable); err != nil {
-		return fmt.Errorf("failed to create klines table: %v", err)
-	}
-
-	log.Println("QuestDB tables initialized")
-	return nil
-}
-
-// Start begins the database processing workers
-func (dm *DatabaseManager) Start() {
-	log.Println("Starting QuestDB manager...")
-
-	dm.wg.Add(3)
-	go dm.processTradeBatches()
-	go dm.processKlineBatches()
-	go dm.periodicFlush()
-}
-
-// AddTrade adds a trade to the processing queue
-func (dm *DatabaseManager) AddTrade(trade *TradeData) {
-	select {
-	case dm.tradeChan <- trade:
-	default:
-		log.Printf("Trade channel full, dropping trade for %s", trade.Symbol)
-	}
-}
-
-// AddKline adds a kline to the processing queue
-func (dm *DatabaseManager) AddKline(kline *KlineData) {
-	select {
-	case dm.klineChan <- kline:
-	default:
-		log.Printf("Kline channel full, dropping kline for %s", kline.Symbol)
-	}
-}
-
-// processTradeBatches processes trades in batches
-func (dm *DatabaseManager) processTradeBatches() {
-	defer dm.wg.Done()
-	ticker := time.NewTicker(dm.config.BatchTimeout)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-dm.ctx.Done():
-			dm.flushTrades()
-			return
-
-		case trade := <-dm.tradeChan:
-			dm.mu.Lock()
-			dm.tradeBatch = append(dm.tradeBatch, trade)
-			shouldFlush := len(dm.tradeBatch) >= dm.config.BatchSize
-			dm.mu.Unlock()
-
-			if shouldFlush {
-				dm.flushTrades()
-			}
-
-		case <-ticker.C:
-			dm.flushTrades()
-		}
-	}
-}
-
-// processKlineBatches processes klines in batches
-func (dm *DatabaseManager) processKlineBatches() {
-	defer dm.wg.Done()
-	ticker := time.NewTicker(dm.config.BatchTimeout)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-dm.ctx.Done():
-			dm.flushKlines()
-			return
-
-		case kline := <-dm.klineChan:
-			dm.mu.Lock()
-			dm.klineBatch = append(dm.klineBatch, kline)
-			shouldFlush := len(dm.klineBatch) >= dm.config.BatchSize
-			dm.mu.Unlock()
-
-			if shouldFlush {
-				dm.flushKlines()
-			}
-
-		case <-ticker.C:
-			dm.flushKlines()
-		}
-	}
-}
-
-// flushTrades writes accumulated trades to QuestDB
-func (dm *DatabaseManager) flushTrades() {
-	dm.mu.Lock()
-	batch := dm.tradeBatch
-	dm.tradeBatch = make([]*TradeData, 0, dm.config.BatchSize)
-	dm.mu.Unlock()
-
-	if len(batch) == 0 {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(dm.ctx, dm.config.DBTimeout)
-	defer cancel()
-
-	// Start transaction
-	tx, err := dm.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to begin transaction for trades: %v", err)
-		return
-	}
-	defer tx.Rollback()
-
-	// Prepare bulk insert
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO trades (
-			trade_time, client_id, symbol, price, quantity, 
-			is_buyer_maker, processed_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`)
-	if err != nil {
-		log.Printf("Failed to prepare trade statement: %v", err)
-		return
-	}
-	defer stmt.Close()
-
-	// Execute batch
-	for _, trade := range batch {
-		_, err := stmt.ExecContext(ctx,
-			trade.TradeTime, trade.ClientID, trade.Symbol, trade.Price, trade.Quantity,
-			trade.IsBuyerMaker, trade.ProcessedAt,
-		)
-		if err != nil {
-			log.Printf("Failed to insert trade: %v", err)
-			return
-		}
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit trades: %v", err)
-		return
-	}
-
-	log.Printf("Inserted %d trades into QuestDB", len(batch))
-}
-
-// flushKlines writes accumulated klines to QuestDB
-func (dm *DatabaseManager) flushKlines() {
-	dm.mu.Lock()
-	batch := dm.klineBatch
-	dm.klineBatch = make([]*KlineData, 0, dm.config.BatchSize)
-	dm.mu.Unlock()
-
-	if len(batch) == 0 {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(dm.ctx, dm.config.DBTimeout)
-	defer cancel()
-
-	// Start transaction
-	tx, err := dm.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to begin transaction for klines: %v", err)
-		return
-	}
-	defer tx.Rollback()
-
-	// Prepare bulk insert
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO klines (
-			open_time, client_id, symbol, interval, close_time,
-			open_price, high_price, low_price, close_price, 
-			volume, is_closed, processed_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-	`)
-	if err != nil {
-		log.Printf("Failed to prepare kline statement: %v", err)
-		return
-	}
-	defer stmt.Close()
-
-	// Execute batch
-	for _, kline := range batch {
-		_, err := stmt.ExecContext(ctx,
-			kline.OpenTime, kline.ClientID, kline.Symbol, kline.Interval, kline.CloseTime,
-			kline.Open, kline.High, kline.Low, kline.Close,
-			kline.Volume, kline.IsClosed, kline.ProcessedAt,
-		)
-		if err != nil {
-			log.Printf("Failed to insert kline: %v", err)
-			return
-		}
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit klines: %v", err)
-		return
-	}
-
-	log.Printf("Inserted %d klines into QuestDB", len(batch))
-}
-
-// periodicFlush ensures data is written even with low volume
-func (dm *DatabaseManager) periodicFlush() {
-	defer dm.wg.Done()
-	ticker := time.NewTicker(dm.config.BatchTimeout * 2)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-dm.ctx.Done():
-			return
-		case <-ticker.C:
-			dm.flushTrades()
-			dm.flushKlines()
-		}
-	}
-}
-
-// Close gracefully shuts down the database manager
-func (dm *DatabaseManager) Close() {
-	log.Println("Shutting down QuestDB manager...")
-	dm.cancel()
-	dm.wg.Wait()
-
-	// Flush any remaining data
-	dm.flushTrades()
-	dm.flushKlines()
-
-	if err := dm.db.Close(); err != nil {
-		log.Printf("Error closing QuestDB connection: %v", err)
-	}
+	stats := c.Stats()
+	log.Printf("[%s] Shutdown complete. Stats: messages=%v, errors=%v",
+		c.clientID, stats["messages_received"], stats["connection_errors"])
 }
 
 // StreamManager manages multiple WebSocket connections
 type StreamManager struct {
-	config    *Config
-	dbManager *DatabaseManager
-	clients   []*WebSocketClient
-	symbols   []string
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	config  *Config
+	clients []*WebSocketClient
+	symbols []string
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	stats   *StreamManagerStats
+}
+
+// StreamManagerStats holds statistics for the stream manager
+type StreamManagerStats struct {
+	totalMessages atomic.Int64
+	totalClients  atomic.Int64
+	startTime     time.Time
 }
 
 // NewStreamManager creates a new stream manager
-func NewStreamManager(config *Config, dbManager *DatabaseManager, symbols []string) *StreamManager {
+func NewStreamManager(config *Config, symbols []string) *StreamManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &StreamManager{
-		config:    config,
-		dbManager: dbManager,
-		symbols:   symbols,
-		ctx:       ctx,
-		cancel:    cancel,
+		config:  config,
+		symbols: symbols,
+		ctx:     ctx,
+		cancel:  cancel,
+		stats: &StreamManagerStats{
+			startTime: time.Now(),
+		},
+	}
+}
+
+// createMessageHandler creates a handler that logs messages to console
+func (sm *StreamManager) createMessageHandler() func(Message) {
+	return func(msg Message) {
+		sm.stats.totalMessages.Add(1)
+
+		if msg.Stream == "" {
+			// Log control messages (subscription responses, errors, etc.)
+			var data map[string]interface{}
+			if err := json.Unmarshal(msg.Data, &data); err == nil {
+				if result, ok := data["result"]; ok {
+					log.Printf("[%s] Control: %v", msg.ClientID, result)
+				} else if errMsg, ok := data["error"]; ok {
+					log.Printf("[%s] Error: %v", msg.ClientID, errMsg)
+				} else {
+					log.Printf("[%s] Unknown control message: %s", msg.ClientID, string(msg.Data))
+				}
+			}
+			return
+		}
+
+		// Log data messages
+		log.Printf("[%s] Stream: %s, Data: %s, Received: %s",
+			msg.ClientID, msg.Stream, string(msg.Data), msg.Received.Format(time.RFC3339Nano))
 	}
 }
 
@@ -900,6 +586,11 @@ func (sm *StreamManager) Start() error {
 		stream := strings.ToLower(symbol) + "@trade"
 		spotStreams[connIndex] = append(spotStreams[connIndex], stream)
 		futuresStreams[connIndex] = append(futuresStreams[connIndex], stream)
+
+		// Also subscribe to 1m klines
+		klineStream := strings.ToLower(symbol) + "@kline_1m"
+		spotStreams[connIndex] = append(spotStreams[connIndex], klineStream)
+		futuresStreams[connIndex] = append(futuresStreams[connIndex], klineStream)
 	}
 
 	// Create and start clients
@@ -908,8 +599,8 @@ func (sm *StreamManager) Start() error {
 			spotClient := NewWebSocketClient(
 				fmt.Sprintf("spot-%d", i),
 				"wss://stream.binance.com:9443/stream",
+				sm.config,
 				handler,
-				sm.config.WorkerPoolSize,
 			)
 
 			if err := spotClient.Subscribe(spotStreams[i]...); err != nil {
@@ -923,14 +614,15 @@ func (sm *StreamManager) Start() error {
 			}
 
 			sm.clients = append(sm.clients, spotClient)
+			sm.stats.totalClients.Add(1)
 		}
 
 		if len(futuresStreams[i]) > 0 {
 			futuresClient := NewWebSocketClient(
 				fmt.Sprintf("futures-%d", i),
 				"wss://fstream.binance.com/stream",
+				sm.config,
 				handler,
-				sm.config.WorkerPoolSize,
 			)
 
 			if err := futuresClient.Subscribe(futuresStreams[i]...); err != nil {
@@ -944,107 +636,64 @@ func (sm *StreamManager) Start() error {
 			}
 
 			sm.clients = append(sm.clients, futuresClient)
+			sm.stats.totalClients.Add(1)
 		}
 	}
 
 	log.Printf("Started %d WebSocket clients", len(sm.clients))
+
+	// Start statistics reporter
+	sm.wg.Add(1)
+	go sm.reportStats()
+
 	return nil
 }
 
-// createMessageHandler creates a handler that processes messages and sends to database
-func (sm *StreamManager) createMessageHandler() func(Message) {
-	return func(msg Message) {
-		if msg.Stream == "" {
+// reportStats periodically reports statistics
+func (sm *StreamManager) reportStats() {
+	defer sm.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.ctx.Done():
 			return
+		case <-ticker.C:
+			uptime := time.Since(sm.stats.startTime)
+			log.Printf("STATS: Uptime=%v, TotalMessages=%d, ActiveClients=%d",
+				uptime.Round(time.Second),
+				sm.stats.totalMessages.Load(),
+				sm.stats.totalClients.Load())
+
+			// Report per-client stats
+			for _, client := range sm.clients {
+				stats := client.Stats()
+				if connected, _ := stats["connected"].(bool); connected {
+					log.Printf("  Client %s: messages=%v, errors=%v",
+						stats["client_id"],
+						stats["messages_received"],
+						stats["connection_errors"])
+				}
+			}
 		}
+	}
+}
 
-		now := time.Now().UTC()
+// GetStats returns current statistics
+func (sm *StreamManager) GetStats() map[string]interface{} {
+	clientStats := make([]map[string]interface{}, len(sm.clients))
+	for i, client := range sm.clients {
+		clientStats[i] = client.Stats()
+	}
 
-		if strings.HasSuffix(msg.Stream, "@trade") {
-			var trade TradeEvent
-			if err := json.Unmarshal(msg.Data, &trade); err != nil {
-				log.Printf("[%s] Trade unmarshal error: %v", msg.ClientID, err)
-				return
-			}
-
-			price, err := strconv.ParseFloat(trade.Price, 64)
-			if err != nil {
-				log.Printf("[%s] Price parse error: %v", msg.ClientID, err)
-				return
-			}
-
-			quantity, err := strconv.ParseFloat(trade.Quantity, 64)
-			if err != nil {
-				log.Printf("[%s] Quantity parse error: %v", msg.ClientID, err)
-				return
-			}
-
-			tradeData := &TradeData{
-				ClientID:     msg.ClientID,
-				Symbol:       trade.Symbol,
-				Price:        price,
-				Quantity:     quantity,
-				TradeTime:    time.Unix(0, trade.TradeTime*int64(time.Millisecond)).UTC(),
-				IsBuyerMaker: trade.IsMaker,
-				ProcessedAt:  now,
-			}
-
-			sm.dbManager.AddTrade(tradeData)
-
-		} else if strings.Contains(msg.Stream, "@kline") {
-			var kline KlineEvent
-			if err := json.Unmarshal(msg.Data, &kline); err != nil {
-				log.Printf("[%s] Kline unmarshal error: %v", msg.ClientID, err)
-				return
-			}
-
-			open, err := strconv.ParseFloat(kline.Kline.Open, 64)
-			if err != nil {
-				log.Printf("[%s] Open price parse error: %v", msg.ClientID, err)
-				return
-			}
-
-			high, err := strconv.ParseFloat(kline.Kline.High, 64)
-			if err != nil {
-				log.Printf("[%s] High price parse error: %v", msg.ClientID, err)
-				return
-			}
-
-			low, err := strconv.ParseFloat(kline.Kline.Low, 64)
-			if err != nil {
-				log.Printf("[%s] Low price parse error: %v", msg.ClientID, err)
-				return
-			}
-
-			close, err := strconv.ParseFloat(kline.Kline.Close, 64)
-			if err != nil {
-				log.Printf("[%s] Close price parse error: %v", msg.ClientID, err)
-				return
-			}
-
-			volume, err := strconv.ParseFloat(kline.Kline.Volume, 64)
-			if err != nil {
-				log.Printf("[%s] Volume parse error: %v", msg.ClientID, err)
-				return
-			}
-
-			klineData := &KlineData{
-				ClientID:    msg.ClientID,
-				Symbol:      kline.Symbol,
-				Interval:    kline.Kline.Interval,
-				OpenTime:    time.Unix(0, kline.Kline.StartTime*int64(time.Millisecond)).UTC(),
-				CloseTime:   time.Unix(0, kline.Kline.CloseTime*int64(time.Millisecond)).UTC(),
-				Open:        open,
-				High:        high,
-				Low:         low,
-				Close:       close,
-				Volume:      volume,
-				IsClosed:    kline.Kline.IsClosed,
-				ProcessedAt: now,
-			}
-
-			sm.dbManager.AddKline(klineData)
-		}
+	return map[string]interface{}{
+		"total_clients":  sm.stats.totalClients.Load(),
+		"total_messages": sm.stats.totalMessages.Load(),
+		"uptime":         time.Since(sm.stats.startTime).String(),
+		"clients":        clientStats,
+		"symbols_count":  len(sm.symbols),
 	}
 }
 
@@ -1057,45 +706,8 @@ func (sm *StreamManager) Close() {
 		client.Shutdown()
 	}
 
+	sm.wg.Wait()
 	log.Println("Stream manager shut down")
-}
-
-// Statistics holds runtime statistics
-type Statistics struct {
-	tradesProcessed  int64
-	klinesProcessed  int64
-	messagesReceived int64
-	startTime        time.Time
-}
-
-// NewStatistics creates a new statistics tracker
-func NewStatistics() *Statistics {
-	return &Statistics{
-		startTime: time.Now(),
-	}
-}
-
-// IncrementTrades increments the trade counter
-func (s *Statistics) IncrementTrades() {
-	atomic.AddInt64(&s.tradesProcessed, 1)
-}
-
-// IncrementKlines increments the kline counter
-func (s *Statistics) IncrementKlines() {
-	atomic.AddInt64(&s.klinesProcessed, 1)
-}
-
-// IncrementMessages increments the message counter
-func (s *Statistics) IncrementMessages() {
-	atomic.AddInt64(&s.messagesReceived, 1)
-}
-
-// GetStats returns current statistics
-func (s *Statistics) GetStats() (int64, int64, int64, time.Duration) {
-	return atomic.LoadInt64(&s.tradesProcessed),
-		atomic.LoadInt64(&s.klinesProcessed),
-		atomic.LoadInt64(&s.messagesReceived),
-		time.Since(s.startTime)
 }
 
 func main() {
@@ -1104,63 +716,26 @@ func main() {
 
 	config := DefaultConfig()
 
-	// Apply environment overrides
-	if host := os.Getenv("QUESTDB_HOST"); host != "" {
-		config.QuestDBHost = host
-	}
-	if portStr := os.Getenv("QUESTDB_PORT"); portStr != "" {
-		if port, err := strconv.Atoi(portStr); err == nil {
-			config.QuestDBPort = port
-		}
-	}
-	if user := os.Getenv("QUESTDB_USER"); user != "" {
-		config.QuestDBUser = user
-	}
-	if pass := os.Getenv("QUESTDB_PASS"); pass != "" {
-		config.QuestDBPass = pass
-	}
-	if name := os.Getenv("QUESTDB_NAME"); name != "" {
-		config.QuestDBName = name
-	}
-
 	symbols := []string{
 		"BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "XRPUSDT",
 		"SOLUSDT", "DOTUSDT", "DOGEUSDT", "AVAXUSDT", "LUNAUSDT",
-		"SHIBUSDT", "MATICUSDT", "NEARUSDT", "ATOMUSDT", "LINKUSDT",
-		"LTCUSDT", "BCHUSDT", "FILUSDT", "TRXUSDT", "ETCUSDT",
 	}
 
 	log.Printf("Starting crypto data collector for %d symbols", len(symbols))
 
-	stats := NewStatistics()
-
-	dbManager, err := NewDatabaseManager(config)
-	if err != nil {
-		log.Fatalf("Failed to initialize QuestDB manager: %v", err)
-	}
-	dbManager.Start()
-
-	streamManager := NewStreamManager(config, dbManager, symbols)
+	streamManager := NewStreamManager(config, symbols)
 	if err := streamManager.Start(); err != nil {
 		log.Fatalf("Failed to start stream manager: %v", err)
 	}
 
-	// Statistics reporting
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
+	log.Printf("System started: %d clients, %d workers",
+		len(streamManager.clients), config.WorkerPoolSize)
 
-		for {
-			select {
-			case <-ticker.C:
-				trades, klines, messages, uptime := stats.GetStats()
-				log.Printf("STATS: Uptime=%v Messages=%d Trades=%d Klines=%d",
-					uptime.Round(time.Second), messages, trades, klines)
-			}
-		}
-	}()
+	// Graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Memory monitoring
+	// Monitor memory usage
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
@@ -1170,26 +745,25 @@ func main() {
 			case <-ticker.C:
 				var m runtime.MemStats
 				runtime.ReadMemStats(&m)
-				log.Printf("MEMORY: Alloc=%.2fMB Sys=%.2fMB NumGC=%d",
-					float64(m.Alloc)/1024/1024, float64(m.Sys)/1024/1024, m.NumGC)
+				log.Printf("MEMORY: Alloc=%.2fMB, TotalAlloc=%.2fMB, Sys=%.2fMB, NumGC=%d",
+					float64(m.Alloc)/1024/1024,
+					float64(m.TotalAlloc)/1024/1024,
+					float64(m.Sys)/1024/1024,
+					m.NumGC)
+			case <-streamManager.ctx.Done():
+				return
 			}
 		}
 	}()
 
-	log.Printf("System started: %d clients, %d workers",
-		len(streamManager.clients), config.WorkerPoolSize)
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	// Wait for interrupt
 	sig := <-sigChan
 	log.Printf("Received %s, shutting down...", sig)
 
 	startShutdown := time.Now()
 	streamManager.Close()
-	dbManager.Close()
 
-	trades, klines, messages, uptime := stats.GetStats()
-	log.Printf("FINAL STATS: Uptime=%v Messages=%d Trades=%d Klines=%d",
-		uptime.Round(time.Second), messages, trades, klines)
+	finalStats := streamManager.GetStats()
+	log.Printf("FINAL STATS: %+v", finalStats)
 	log.Printf("Shutdown completed in %v", time.Since(startShutdown))
 }
