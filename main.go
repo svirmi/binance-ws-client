@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,6 @@ const (
 	BatchSize      = 180
 	BatchPause     = 300 * time.Millisecond
 	RawBuffer      = 20000
-	WorkerCount    = 8
 	QueueWarnEvery = 3 * time.Second
 	ReadDeadline   = 90 * time.Second
 	PingInterval   = 3 * time.Minute
@@ -277,6 +277,7 @@ func logControlMessage(b []byte) {
 }
 
 func startWorkers(ctx context.Context, rawChan <-chan RawWSMessage, wg *sync.WaitGroup) {
+	WorkerCount := runtime.NumCPU()
 	wg.Add(WorkerCount)
 	for i := 0; i < WorkerCount; i++ {
 		go func(id int) {
