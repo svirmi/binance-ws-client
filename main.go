@@ -62,10 +62,9 @@ func NewBinanceFuturesWebSocketClient(symbols []string) *BinanceFuturesWebSocket
 		cancel:      cancel,
 		isRunning:   atomic.Bool{},
 		msgCounter:  atomic.Int64{},
-		dropCounter: atomic.Int64{}, // [NEW] Init counter
-		// [NEW] Initialize channel with a buffer.
-		// If the worker is slower than the stream for 2000 messages, we start dropping.
-		msgChan: make(chan []byte, 2000),
+		dropCounter: atomic.Int64{},
+		// [MODIFIED] Increased buffer size to 10,000 to better handle high-frequency bursts
+		msgChan: make(chan []byte, 10000),
 	}
 }
 
@@ -78,17 +77,21 @@ func (c *BinanceFuturesWebSocketClient) Start() error {
 	c.wg.Add(1)
 	go c.run()
 
-	// [NEW] Start the dedicated worker loop for processing
-	c.wg.Add(1)
-	go c.workerLoop()
+	// [MODIFIED] Worker Pool: Start multiple workers to process messages in parallel.
+	// This significantly increases throughput (JSON parsing is CPU bound).
+	numWorkers := 10
+	for i := 0; i < numWorkers; i++ {
+		c.wg.Add(1)
+		go c.workerLoop(i)
+	}
 
 	return nil
 }
 
-// [NEW] workerLoop consumes messages from the buffer and processes them.
-// This runs independently of the WebSocket connection speed.
-func (c *BinanceFuturesWebSocketClient) workerLoop() {
+// [MODIFIED] workerLoop consumes messages from the buffer and processes them.
+func (c *BinanceFuturesWebSocketClient) workerLoop(id int) {
 	defer c.wg.Done()
+	// log.Printf("Worker %d started", id) // Optional debug
 
 	for {
 		select {
@@ -217,6 +220,11 @@ func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connCa
 
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
+			// Suppress "use of closed network connection" error on shutdown
+			if !c.isRunning.Load() && strings.Contains(err.Error(), "use of closed network connection") {
+				return
+			}
+
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				log.Printf("[readLoop] WebSocket read error: %v", err)
 			} else {
@@ -226,14 +234,12 @@ func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connCa
 			return
 		}
 
-		// [MODIFIED] Non-blocking send logic
 		select {
 		case c.msgChan <- message:
 			// Message successfully buffered
 		default:
 			// Channel is full (worker is too slow)
 			c.dropCounter.Add(1)
-			// log.Println("WARNING: Dropping message, buffer full!") // Optional verbose logging
 		}
 	}
 }
@@ -301,9 +307,7 @@ func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
 
 func (c *BinanceFuturesWebSocketClient) logBookTicker(ticker BookTickerData) {
 	var ts time.Time
-	// [MODIFIED] Added artificial delay to simulate slow processing for testing
-	// Remove this line in production!
-	// time.Sleep(50 * time.Millisecond)
+	// Removed artificial sleep for production performance
 
 	if ticker.EventTs > 0 {
 		ts = time.Unix(0, ticker.EventTs*int64(time.Millisecond))
@@ -366,7 +370,6 @@ func main() {
 			select {
 			case <-statsTicker.C:
 				if client.isRunning.Load() {
-					// [MODIFIED] Enhanced stats logging
 					processed := client.msgCounter.Load()
 					dropped := client.dropCounter.Load()
 					pending := len(client.msgChan)
