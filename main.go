@@ -19,50 +19,57 @@ import (
 
 // BinanceFuturesWebSocketClient for orderbook level 1 data
 type BinanceFuturesWebSocketClient struct {
-	conn       *websocket.Conn
-	url        string
-	symbols    []string
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	isRunning  atomic.Bool
-	msgCounter atomic.Int64
+	conn        *websocket.Conn
+	url         string
+	symbols     []string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	isRunning   atomic.Bool
+	msgCounter  atomic.Int64 // Counts successfully processed messages
+	dropCounter atomic.Int64 // [NEW] Counts messages dropped due to full buffer
+
+	// [NEW] Buffer for messages. Decouples reading from processing.
+	msgChan chan []byte
 }
 
 // BookTickerData represents the orderbook level 1 data from Binance
 type BookTickerData struct {
-	EventType string `json:"e"` // Event type (should be "bookTicker")
-	UpdateID  int64  `json:"u"` // Order book updateId
-	Symbol    string `json:"s"` // Symbol
-	BidPrice  string `json:"b"` // Best bid price
-	BidQty    string `json:"B"` // Best bid quantity
-	AskPrice  string `json:"a"` // Best ask price
-	AskQty    string `json:"A"` // Best ask quantity
-	EventTs   int64  `json:"E"` // Event time
-	TransTs   int64  `json:"T"` // Transaction time
+	EventType string `json:"e"`
+	UpdateID  int64  `json:"u"`
+	Symbol    string `json:"s"`
+	BidPrice  string `json:"b"`
+	BidQty    string `json:"B"`
+	AskPrice  string `json:"a"`
+	AskQty    string `json:"A"`
+	EventTs   int64  `json:"E"`
+	TransTs   int64  `json:"T"`
 }
 
 // NewBinanceFuturesWebSocketClient creates a new client
 func NewBinanceFuturesWebSocketClient(symbols []string) *BinanceFuturesWebSocketClient {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Convert symbols to lowercase for WebSocket streams
 	lowerSymbols := make([]string, len(symbols))
 	for i, symbol := range symbols {
 		lowerSymbols[i] = strings.ToLower(symbol)
 	}
 
 	return &BinanceFuturesWebSocketClient{
-		url:        "wss://fstream.binance.com/ws",
-		symbols:    lowerSymbols,
-		ctx:        ctx,
-		cancel:     cancel,
-		isRunning:  atomic.Bool{},
-		msgCounter: atomic.Int64{},
+		url:         "wss://fstream.binance.com/ws",
+		symbols:     lowerSymbols,
+		ctx:         ctx,
+		cancel:      cancel,
+		isRunning:   atomic.Bool{},
+		msgCounter:  atomic.Int64{},
+		dropCounter: atomic.Int64{}, // [NEW] Init counter
+		// [NEW] Initialize channel with a buffer.
+		// If the worker is slower than the stream for 2000 messages, we start dropping.
+		msgChan: make(chan []byte, 2000),
 	}
 }
 
-// Start kicks off the main run loop that manages connection and reconnection.
+// Start kicks off the main run loop
 func (c *BinanceFuturesWebSocketClient) Start() error {
 	if !c.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("client already running")
@@ -71,10 +78,30 @@ func (c *BinanceFuturesWebSocketClient) Start() error {
 	c.wg.Add(1)
 	go c.run()
 
+	// [NEW] Start the dedicated worker loop for processing
+	c.wg.Add(1)
+	go c.workerLoop()
+
 	return nil
 }
 
-// run manages the connect → read/heartbeat → reconnect loop.
+// [NEW] workerLoop consumes messages from the buffer and processes them.
+// This runs independently of the WebSocket connection speed.
+func (c *BinanceFuturesWebSocketClient) workerLoop() {
+	defer c.wg.Done()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case msg := <-c.msgChan:
+			// Actual heavy lifting (JSON parsing, logging) happens here
+			c.processMessage(msg)
+			c.msgCounter.Add(1)
+		}
+	}
+}
+
 func (c *BinanceFuturesWebSocketClient) run() {
 	defer c.wg.Done()
 
@@ -82,14 +109,12 @@ func (c *BinanceFuturesWebSocketClient) run() {
 	maxBackoff := 30 * time.Second
 
 	for c.isRunning.Load() {
-		// Top-level context canceled? Then we exit the whole run loop.
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
 		}
 
-		// --- Connect ---
 		conn, err := c.connect()
 		if err != nil {
 			log.Printf("[run] Failed to connect: %v", err)
@@ -101,25 +126,19 @@ func (c *BinanceFuturesWebSocketClient) run() {
 			continue
 		}
 
-		// Reset backoff on successful connect
 		backoff = time.Second
 		c.conn = conn
 		log.Println("[run] Connected and subscribed successfully")
 
-		// --- Per-connection context ---
 		connCtx, connCancel := context.WithCancel(c.ctx)
-
-		// Start loops tied to this connection
 		var connWG sync.WaitGroup
 		connWG.Add(2)
 		go c.readLoop(connCtx, connCancel, &connWG)
 		go c.heartbeatLoop(connCtx, connCancel, &connWG)
 
-		// Wait until both loops finish (they call connCancel on error)
 		connWG.Wait()
 		connCancel()
 
-		// Close this connection safely once loops are done
 		if c.conn != nil {
 			_ = c.conn.Close()
 			c.conn = nil
@@ -133,7 +152,6 @@ func (c *BinanceFuturesWebSocketClient) run() {
 	}
 }
 
-// connect dials Binance, sets handlers, and subscribes to bookTicker streams.
 func (c *BinanceFuturesWebSocketClient) connect() (*websocket.Conn, error) {
 	log.Printf("[connect] Starting Binance Futures WebSocket client for %d symbols", len(c.symbols))
 
@@ -147,8 +165,6 @@ func (c *BinanceFuturesWebSocketClient) connect() (*websocket.Conn, error) {
 
 	conn.SetPongHandler(func(appData string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
-		// Uncomment if you want to see pongs:
-		// log.Printf("[pong] %s", appData)
 		return nil
 	})
 
@@ -163,7 +179,6 @@ func (c *BinanceFuturesWebSocketClient) connect() (*websocket.Conn, error) {
 		return nil
 	})
 
-	// Subscribe to bookTicker streams
 	params := make([]string, 0, len(c.symbols))
 	for _, symbol := range c.symbols {
 		stream := fmt.Sprintf("%s@bookTicker", symbol)
@@ -184,7 +199,6 @@ func (c *BinanceFuturesWebSocketClient) connect() (*websocket.Conn, error) {
 	return conn, nil
 }
 
-// readLoop reads and processes incoming messages for a single connection.
 func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connCancel context.CancelFunc, connWG *sync.WaitGroup) {
 	defer connWG.Done()
 
@@ -208,21 +222,25 @@ func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connCa
 			} else {
 				log.Printf("[readLoop] WebSocket read error (non-unexpected): %v", err)
 			}
-			// Trigger reconnect by canceling this connection context.
 			connCancel()
 			return
 		}
 
-		c.processMessage(message)
-		c.msgCounter.Add(1)
+		// [MODIFIED] Non-blocking send logic
+		select {
+		case c.msgChan <- message:
+			// Message successfully buffered
+		default:
+			// Channel is full (worker is too slow)
+			c.dropCounter.Add(1)
+			// log.Println("WARNING: Dropping message, buffer full!") // Optional verbose logging
+		}
 	}
 }
 
-// heartbeatLoop sends periodic pings to keep connection alive.
 func (c *BinanceFuturesWebSocketClient) heartbeatLoop(connCtx context.Context, connCancel context.CancelFunc, connWG *sync.WaitGroup) {
 	defer connWG.Done()
 
-	// Binance recommends ping/pong every 3 minutes if idle
 	interval := 3 * time.Minute
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -239,7 +257,6 @@ func (c *BinanceFuturesWebSocketClient) heartbeatLoop(connCtx context.Context, c
 			payload := []byte(fmt.Sprintf("%d", time.Now().UnixMilli()))
 			if err := c.conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
 				log.Printf("[heartbeatLoop] Failed to send ping control frame: %v", err)
-				// Trigger reconnect
 				connCancel()
 				return
 			}
@@ -247,25 +264,20 @@ func (c *BinanceFuturesWebSocketClient) heartbeatLoop(connCtx context.Context, c
 	}
 }
 
-// processMessage handles incoming WebSocket messages
 func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
-	// Try to parse as book ticker event first (direct format)
 	var bookTicker BookTickerData
 	if err := json.Unmarshal(data, &bookTicker); err == nil {
-		// Check if it's a bookTicker event and has required fields
 		if bookTicker.EventType == "bookTicker" && bookTicker.Symbol != "" && bookTicker.BidPrice != "" && bookTicker.AskPrice != "" {
 			c.logBookTicker(bookTicker)
 			return
 		}
 	}
 
-	// Try combined stream format (stream wrapper)
 	var combinedMsg struct {
 		Stream string          `json:"stream"`
 		Data   json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(data, &combinedMsg); err == nil && combinedMsg.Stream != "" {
-		// Check if it's a bookTicker stream
 		if strings.Contains(combinedMsg.Stream, "@bookTicker") {
 			var ticker BookTickerData
 			if err := json.Unmarshal(combinedMsg.Data, &ticker); err == nil {
@@ -275,11 +287,9 @@ func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
 		return
 	}
 
-	// Check if it's a control message (subscription response, error)
 	var controlMsg map[string]interface{}
 	if err := json.Unmarshal(data, &controlMsg); err == nil {
 		if _, ok := controlMsg["result"]; ok {
-			// Subscription confirmation, ignore
 			return
 		}
 		if errVal, ok := controlMsg["error"]; ok {
@@ -287,16 +297,14 @@ func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
 			return
 		}
 	}
-
-	// Log unhandled messages for debugging (skip very small ones)
-	if len(data) > 10 {
-		log.Printf("[processMessage] DEBUG - Unhandled message structure: %s", string(data))
-	}
 }
 
-// logBookTicker logs orderbook level 1 data
 func (c *BinanceFuturesWebSocketClient) logBookTicker(ticker BookTickerData) {
 	var ts time.Time
+	// [MODIFIED] Added artificial delay to simulate slow processing for testing
+	// Remove this line in production!
+	// time.Sleep(50 * time.Millisecond)
+
 	if ticker.EventTs > 0 {
 		ts = time.Unix(0, ticker.EventTs*int64(time.Millisecond))
 	} else if ticker.TransTs > 0 {
@@ -312,7 +320,6 @@ func (c *BinanceFuturesWebSocketClient) logBookTicker(ticker BookTickerData) {
 		ts.Format("15:04:05.000"))
 }
 
-// Stop gracefully stops the client
 func (c *BinanceFuturesWebSocketClient) Stop() {
 	log.Println("Stopping Binance Futures WebSocket client...")
 
@@ -332,10 +339,13 @@ func (c *BinanceFuturesWebSocketClient) Stop() {
 
 	c.wg.Wait()
 
-	log.Printf("Client stopped. Total messages processed: %d", c.msgCounter.Load())
+	processed := c.msgCounter.Load()
+	dropped := c.dropCounter.Load()
+	log.Printf("Client stopped. Processed: %d, Dropped: %d", processed, dropped)
 }
 
 func main() {
+	// rand.Seed is deprecated in newer Go versions, but kept for compatibility
 	rand.Seed(time.Now().UnixNano())
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
@@ -346,11 +356,9 @@ func main() {
 
 	log.Printf("Starting Orderbook Level 1 Data Collector for %d symbols", len(symbols))
 
-	// Create and start client
 	client := NewBinanceFuturesWebSocketClient(symbols)
 
-	// Start statistics reporter
-	statsTicker := time.NewTicker(30 * time.Second)
+	statsTicker := time.NewTicker(5 * time.Second)
 	defer statsTicker.Stop()
 
 	go func() {
@@ -358,7 +366,14 @@ func main() {
 			select {
 			case <-statsTicker.C:
 				if client.isRunning.Load() {
-					log.Printf("STATS: Messages processed: %d", client.msgCounter.Load())
+					// [MODIFIED] Enhanced stats logging
+					processed := client.msgCounter.Load()
+					dropped := client.dropCounter.Load()
+					pending := len(client.msgChan)
+					cap := cap(client.msgChan)
+
+					log.Printf("STATS: Processed: %d | Dropped: %d | Buffer: %d/%d",
+						processed, dropped, pending, cap)
 				}
 			case <-client.ctx.Done():
 				return
@@ -366,12 +381,10 @@ func main() {
 		}
 	}()
 
-	// Start the client
 	if err := client.Start(); err != nil {
 		log.Fatalf("Failed to start client: %v", err)
 	}
 
-	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
@@ -380,7 +393,6 @@ func main() {
 	<-sigChan
 	log.Println("\nShutdown signal received")
 
-	// Stop the client
 	client.Stop()
 
 	log.Println("Orderbook data collector stopped")
