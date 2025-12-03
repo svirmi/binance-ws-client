@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,7 +80,7 @@ func (c *BinanceFuturesWebSocketClient) Start() error {
 
 	// [MODIFIED] Worker Pool: Start multiple workers to process messages in parallel.
 	// This significantly increases throughput (JSON parsing is CPU bound).
-	numWorkers := 10
+	numWorkers := runtime.NumCPU()
 	for i := 0; i < numWorkers; i++ {
 		c.wg.Add(1)
 		go c.workerLoop(i)
