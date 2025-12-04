@@ -1,11 +1,15 @@
+// main.go
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
-	"math/rand"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -18,386 +22,340 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// BinanceFuturesWebSocketClient for orderbook level 1 data
-type BinanceFuturesWebSocketClient struct {
-	conn        *websocket.Conn
-	url         string
-	symbols     []string
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	isRunning   atomic.Bool
-	msgCounter  atomic.Int64 // Counts successfully processed messages
-	dropCounter atomic.Int64 // [NEW] Counts messages dropped due to full buffer
+const (
+	BinanceWSURL   = "wss://fstream.binance.com/ws"
+	BatchSize      = 180
+	BatchPause     = 300 * time.Millisecond
+	RawBuffer      = 20000
+	QueueWarnEvery = 3 * time.Second
+	ReadDeadline   = 90 * time.Second
+	PingInterval   = 3 * time.Minute
 
-	// [NEW] Buffer for messages. Decouples reading from processing.
-	msgChan chan []byte
+	ReconnectBaseDelay = 1 * time.Second
+	ReconnectMaxDelay  = 30 * time.Second
+)
+
+var dropCounter int64
+
+type RawWSMessage struct {
+	Data []byte
 }
 
-// BookTickerData represents the orderbook level 1 data from Binance
-type BookTickerData struct {
+type BookTicker struct {
 	EventType string `json:"e"`
-	UpdateID  int64  `json:"u"`
+	EventTime int64  `json:"E"`
 	Symbol    string `json:"s"`
 	BidPrice  string `json:"b"`
 	BidQty    string `json:"B"`
 	AskPrice  string `json:"a"`
 	AskQty    string `json:"A"`
-	EventTs   int64  `json:"E"`
 	TransTs   int64  `json:"T"`
 }
 
-// NewBinanceFuturesWebSocketClient creates a new client
-func NewBinanceFuturesWebSocketClient(symbols []string) *BinanceFuturesWebSocketClient {
+type ControlMsg struct {
+	Result interface{} `json:"result"`
+	ID     int64       `json:"id"`
+	Error  *struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	} `json:"error"`
+}
+
+func main() {
+	log.Println("starting binance client")
+
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	lowerSymbols := make([]string, len(symbols))
-	for i, symbol := range symbols {
-		lowerSymbols[i] = strings.ToLower(symbol)
-	}
+	rawChan := make(chan RawWSMessage, RawBuffer)
+	var wg sync.WaitGroup
 
-	return &BinanceFuturesWebSocketClient{
-		url:         "wss://fstream.binance.com/ws",
-		symbols:     lowerSymbols,
-		ctx:         ctx,
-		cancel:      cancel,
-		isRunning:   atomic.Bool{},
-		msgCounter:  atomic.Int64{},
-		dropCounter: atomic.Int64{},
-		// [MODIFIED] Increased buffer size to 10,000 to better handle high-frequency bursts
-		msgChan: make(chan []byte, 10000),
-	}
+	// start workers
+	startWorkers(ctx, rawChan, &wg)
+	go monitorQueue(rawChan)
+
+	// managed connection: read, ping, reconnect
+	go manageConnection(ctx, rawChan)
+
+	// graceful shutdown
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	log.Println("shutdown signal received")
+	cancel()
+
+	wg.Wait()
+	log.Printf("FINAL STATS: dropped=%d", atomic.LoadInt64(&dropCounter))
+	log.Println("exited")
 }
 
-// Start kicks off the main run loop
-func (c *BinanceFuturesWebSocketClient) Start() error {
-	if !c.isRunning.CompareAndSwap(false, true) {
-		return fmt.Errorf("client already running")
-	}
-
-	c.wg.Add(1)
-	go c.run()
-
-	// [MODIFIED] Worker Pool: Start multiple workers to process messages in parallel.
-	// This significantly increases throughput (JSON parsing is CPU bound).
-	numWorkers := runtime.NumCPU()
-	for i := 0; i < numWorkers; i++ {
-		c.wg.Add(1)
-		go c.workerLoop(i)
-	}
-
-	return nil
-}
-
-// [MODIFIED] workerLoop consumes messages from the buffer and processes them.
-func (c *BinanceFuturesWebSocketClient) workerLoop(id int) {
-	defer c.wg.Done()
-	// log.Printf("Worker %d started", id) // Optional debug
+// manageConnection keeps the websocket alive with auto-reconnect and heartbeat
+func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage) {
+	delay := ReconnectBaseDelay
 
 	for {
-		select {
-		case <-c.ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case msg := <-c.msgChan:
-			// Actual heavy lifting (JSON parsing, logging) happens here
-			c.processMessage(msg)
-			c.msgCounter.Add(1)
-		}
-	}
-}
-
-func (c *BinanceFuturesWebSocketClient) run() {
-	defer c.wg.Done()
-
-	backoff := time.Second
-	maxBackoff := 30 * time.Second
-
-	for c.isRunning.Load() {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
 		}
 
-		conn, err := c.connect()
+		conn, err := connectAndSubscribe()
 		if err != nil {
-			log.Printf("[run] Failed to connect: %v", err)
-			time.Sleep(backoff)
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
+			log.Printf("connect/subscribe failed: %v", err)
+			time.Sleep(delay)
+			delay *= 2
+			if delay > ReconnectMaxDelay {
+				delay = ReconnectMaxDelay
 			}
 			continue
 		}
+		log.Println("connection established")
+		delay = ReconnectBaseDelay
 
-		backoff = time.Second
-		c.conn = conn
-		log.Println("[run] Connected and subscribed successfully")
+		// ping ticker
+		pingTicker := time.NewTicker(PingInterval)
+		defer pingTicker.Stop()
 
-		connCtx, connCancel := context.WithCancel(c.ctx)
-		var connWG sync.WaitGroup
-		connWG.Add(2)
-		go c.readLoop(connCtx, connCancel, &connWG)
-		go c.heartbeatLoop(connCtx, connCancel, &connWG)
+		readErrChan := make(chan error, 1)
 
-		connWG.Wait()
-		connCancel()
+		// read loop
+		go func() {
+			readErrChan <- readLoop(ctx, conn, rawChan)
+		}()
 
-		if c.conn != nil {
-			_ = c.conn.Close()
-			c.conn = nil
+	loop:
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("context canceled, closing connection")
+				conn.Close()
+				return
+			case <-pingTicker.C:
+				payload := []byte(fmt.Sprintf("%d", time.Now().UnixMilli()))
+				deadline := time.Now().Add(5 * time.Second)
+				if err := conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
+					log.Printf("ping error: %v", err)
+					conn.Close()
+					break loop
+				}
+			case err := <-readErrChan:
+				log.Printf("readLoop exited: %v", err)
+				conn.Close()
+				break loop
+			}
 		}
 
-		if !c.isRunning.Load() || c.ctx.Err() != nil {
-			return
+		log.Printf("reconnecting in %s...", delay)
+		time.Sleep(delay)
+		delay *= 2
+		if delay > ReconnectMaxDelay {
+			delay = ReconnectMaxDelay
 		}
-
-		log.Println("[run] Attempting to reconnect...")
 	}
 }
 
-func (c *BinanceFuturesWebSocketClient) connect() (*websocket.Conn, error) {
-	log.Printf("[connect] Starting Binance Futures WebSocket client for %d symbols", len(c.symbols))
-
-	conn, _, err := websocket.DefaultDialer.Dial(c.url, nil)
+// connectAndSubscribe establishes a websocket connection and subscribes to streams
+func connectAndSubscribe() (*websocket.Conn, error) {
+	d := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	conn, _, err := d.Dial(BinanceWSURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Binance: %w", err)
+		return nil, err
 	}
 
-	readTimeout := 90 * time.Second
-	conn.SetReadDeadline(time.Now().Add(readTimeout))
-
-	conn.SetPongHandler(func(appData string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+	conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(ReadDeadline))
 		return nil
 	})
-
-	conn.SetPingHandler(func(appData string) error {
+	conn.SetPingHandler(func(msg string) error {
 		deadline := time.Now().Add(5 * time.Second)
-		err := conn.WriteControl(websocket.PongMessage, []byte(appData), deadline)
-		if err != nil {
-			log.Printf("[ping-handler] Failed to send pong: %v", err)
-		} else {
-			_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
-		}
-		return nil
+		return conn.WriteControl(websocket.PongMessage, []byte(msg), deadline)
 	})
 
-	params := make([]string, 0, len(c.symbols))
-	for _, symbol := range c.symbols {
-		stream := fmt.Sprintf("%s@bookTicker", symbol)
-		params = append(params, stream)
-	}
-
-	subscribeMsg := map[string]interface{}{
-		"method": "SUBSCRIBE",
-		"params": params,
-		"id":     1,
-	}
-
-	if err := conn.WriteJSON(subscribeMsg); err != nil {
+	symbolsList, err := symbols()
+	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("failed to subscribe: %w", err)
+		return nil, fmt.Errorf("failed to fetch symbols: %w", err)
+	}
+	symbolsLower := make([]string, len(symbolsList))
+	for i, s := range symbolsList {
+		symbolsLower[i] = strings.ToLower(s)
+	}
+
+	params := make([]string, 0, len(symbolsLower))
+	for _, s := range symbolsLower {
+		params = append(params, s+"@bookTicker")
+	}
+
+	if err := subscribeInBatches(conn, params); err != nil {
+		conn.Close()
+		return nil, err
 	}
 
 	return conn, nil
 }
 
-func (c *BinanceFuturesWebSocketClient) readLoop(connCtx context.Context, connCancel context.CancelFunc, connWG *sync.WaitGroup) {
-	defer connWG.Done()
+func subscribeInBatches(conn *websocket.Conn, params []string) error {
+	for i := 0; i < len(params); i += BatchSize {
+		end := i + BatchSize
+		if end > len(params) {
+			end = len(params)
+		}
+		batch := params[i:end]
+		msg := map[string]interface{}{
+			"method": "SUBSCRIBE",
+			"params": batch,
+			"id":     time.Now().UnixNano(),
+		}
+		if err := conn.WriteJSON(msg); err != nil {
+			log.Printf("ERROR sending subscribe batch: %v", err)
+			return fmt.Errorf("failed to send subscribe batch: %w", err)
+		}
+		log.Printf("subscribe batch sent (%d streams)", len(batch))
+		time.Sleep(BatchPause)
+	}
+	return nil
+}
 
+// readLoop reads messages and pushes to rawChan
+func readLoop(ctx context.Context, conn *websocket.Conn, rawChan chan<- RawWSMessage) error {
 	for {
 		select {
-		case <-connCtx.Done():
-			return
+		case <-ctx.Done():
+			return fmt.Errorf("context canceled")
 		default:
 		}
 
-		if c.conn == nil {
-			return
-		}
-
-		c.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-
-		_, message, err := c.conn.ReadMessage()
+		_ = conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+		_, data, err := conn.ReadMessage()
 		if err != nil {
-			// Suppress "use of closed network connection" error on shutdown
-			if !c.isRunning.Load() && strings.Contains(err.Error(), "use of closed network connection") {
-				return
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
+				strings.Contains(err.Error(), "use of closed network connection") {
+				return fmt.Errorf("connection closed")
 			}
+			if isTemporaryNetErr(err) {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("read error: %w", err)
+		}
 
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("[readLoop] WebSocket read error: %v", err)
-			} else {
-				log.Printf("[readLoop] WebSocket read error (non-unexpected): %v", err)
-			}
-			connCancel()
-			return
+		if looksLikeControlMessage(data) {
+			logControlMessage(data)
+			continue
 		}
 
 		select {
-		case c.msgChan <- message:
-			// Message successfully buffered
+		case rawChan <- RawWSMessage{Data: data}:
 		default:
-			// Channel is full (worker is too slow)
-			c.dropCounter.Add(1)
+			atomic.AddInt64(&dropCounter, 1)
 		}
 	}
 }
 
-func (c *BinanceFuturesWebSocketClient) heartbeatLoop(connCtx context.Context, connCancel context.CancelFunc, connWG *sync.WaitGroup) {
-	defer connWG.Done()
-
-	interval := 3 * time.Minute
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-connCtx.Done():
-			return
-		case <-ticker.C:
-			if c.conn == nil {
-				return
-			}
-			deadline := time.Now().Add(5 * time.Second)
-			payload := []byte(fmt.Sprintf("%d", time.Now().UnixMilli()))
-			if err := c.conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
-				log.Printf("[heartbeatLoop] Failed to send ping control frame: %v", err)
-				connCancel()
-				return
-			}
-		}
+func isTemporaryNetErr(err error) bool {
+	if nerr, ok := err.(net.Error); ok {
+		return nerr.Temporary() || nerr.Timeout()
 	}
+	return false
 }
 
-func (c *BinanceFuturesWebSocketClient) processMessage(data []byte) {
-	var bookTicker BookTickerData
-	if err := json.Unmarshal(data, &bookTicker); err == nil {
-		if bookTicker.EventType == "bookTicker" && bookTicker.Symbol != "" && bookTicker.BidPrice != "" && bookTicker.AskPrice != "" {
-			c.logBookTicker(bookTicker)
-			return
-		}
-	}
+func looksLikeControlMessage(b []byte) bool {
+	return len(b) > 0 && (bytes.Contains(b, []byte(`"result"`)) || bytes.Contains(b, []byte(`"error"`)))
+}
 
-	var combinedMsg struct {
-		Stream string          `json:"stream"`
-		Data   json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(data, &combinedMsg); err == nil && combinedMsg.Stream != "" {
-		if strings.Contains(combinedMsg.Stream, "@bookTicker") {
-			var ticker BookTickerData
-			if err := json.Unmarshal(combinedMsg.Data, &ticker); err == nil {
-				c.logBookTicker(ticker)
-			}
-		}
+func logControlMessage(b []byte) {
+	var m ControlMsg
+	if err := json.Unmarshal(b, &m); err != nil {
+		log.Printf("control message (unparseable): %s", string(b))
 		return
 	}
-
-	var controlMsg map[string]interface{}
-	if err := json.Unmarshal(data, &controlMsg); err == nil {
-		if _, ok := controlMsg["result"]; ok {
-			return
-		}
-		if errVal, ok := controlMsg["error"]; ok {
-			log.Printf("[processMessage] Received error from Binance: %v", errVal)
-			return
-		}
-	}
-}
-
-func (c *BinanceFuturesWebSocketClient) logBookTicker(ticker BookTickerData) {
-	var ts time.Time
-	// Removed artificial sleep for production performance
-
-	if ticker.EventTs > 0 {
-		ts = time.Unix(0, ticker.EventTs*int64(time.Millisecond))
-	} else if ticker.TransTs > 0 {
-		ts = time.Unix(0, ticker.TransTs*int64(time.Millisecond))
-	} else {
-		ts = time.Now()
-	}
-
-	log.Printf("%s | Bid: %s/%s | Ask: %s/%s | %s",
-		strings.ToUpper(ticker.Symbol),
-		ticker.BidPrice, ticker.BidQty,
-		ticker.AskPrice, ticker.AskQty,
-		ts.Format("15:04:05.000"))
-}
-
-func (c *BinanceFuturesWebSocketClient) Stop() {
-	log.Println("Stopping Binance Futures WebSocket client...")
-
-	if !c.isRunning.CompareAndSwap(true, false) {
+	if m.Error != nil {
+		log.Printf("CONTROL ERROR: code=%d msg=%s", m.Error.Code, m.Error.Msg)
 		return
 	}
-
-	c.cancel()
-
-	if c.conn != nil {
-		_ = c.conn.WriteMessage(
-			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-		)
-		_ = c.conn.Close()
-	}
-
-	c.wg.Wait()
-
-	processed := c.msgCounter.Load()
-	dropped := c.dropCounter.Load()
-	log.Printf("Client stopped. Processed: %d, Dropped: %d", processed, dropped)
+	log.Printf("CONTROL OK: id=%d result=%v", m.ID, m.Result)
 }
 
-func main() {
-	// rand.Seed is deprecated in newer Go versions, but kept for compatibility
-	rand.Seed(time.Now().UnixNano())
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
-	symbols := []string{
-		"BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "XRPUSDT",
-		"SOLUSDT", "DOTUSDT", "DOGEUSDT", "AVAXUSDT", "LUNAUSDT",
-	}
-
-	log.Printf("Starting Orderbook Level 1 Data Collector for %d symbols", len(symbols))
-
-	client := NewBinanceFuturesWebSocketClient(symbols)
-
-	statsTicker := time.NewTicker(5 * time.Second)
-	defer statsTicker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-statsTicker.C:
-				if client.isRunning.Load() {
-					processed := client.msgCounter.Load()
-					dropped := client.dropCounter.Load()
-					pending := len(client.msgChan)
-					cap := cap(client.msgChan)
-
-					log.Printf("STATS: Processed: %d | Dropped: %d | Buffer: %d/%d",
-						processed, dropped, pending, cap)
+func startWorkers(ctx context.Context, rawChan <-chan RawWSMessage, wg *sync.WaitGroup) {
+	WorkerCount := runtime.NumCPU()
+	wg.Add(WorkerCount)
+	for i := 0; i < WorkerCount; i++ {
+		go func(id int) {
+			defer wg.Done()
+			log.Printf("worker %d started", id)
+			for {
+				select {
+				case <-ctx.Done():
+					log.Printf("worker %d exiting (ctx canceled)", id)
+					return
+				case raw, ok := <-rawChan:
+					if !ok {
+						log.Printf("worker %d exiting (channel closed)", id)
+						return
+					}
+					processRaw(raw.Data)
 				}
-			case <-client.ctx.Done():
-				return
 			}
-		}
-	}()
+		}(i)
+	}
+}
 
-	if err := client.Start(); err != nil {
-		log.Fatalf("Failed to start client: %v", err)
+func processRaw(b []byte) {
+	var bt BookTicker
+	if err := json.Unmarshal(b, &bt); err != nil {
+		return
+	}
+	ts := time.Now()
+	if bt.EventTime > 0 {
+		ts = time.Unix(0, bt.EventTime*int64(time.Millisecond))
+	}
+	log.Printf("%s | bid=%s qty=%s | ask=%s qty=%s | %s",
+		bt.Symbol, bt.BidPrice, bt.BidQty, bt.AskPrice, bt.AskQty, ts.Format("15:04:05.000"))
+}
+
+func monitorQueue(ch chan RawWSMessage) {
+	t := time.NewTicker(QueueWarnEvery)
+	defer t.Stop()
+	for range t.C {
+		n := len(ch)
+		if n > RawBuffer/2 {
+			log.Printf("WARNING: queue usage high: %d/%d", n, RawBuffer)
+		}
+	}
+}
+
+// symbols fetches symbols from external API
+func symbols() ([]string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("http://152.70.55.44:8080/intersection/futures")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 
-	log.Println("Press Ctrl+C to stop...")
+	var apiResp struct {
+		Symbols []struct {
+			Symbol string `json:"symbol"`
+		} `json:"symbols"`
+	}
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return nil, err
+	}
 
-	<-sigChan
-	log.Println("\nShutdown signal received")
+	list := make([]string, len(apiResp.Symbols))
+	for i, s := range apiResp.Symbols {
+		list[i] = s.Symbol
+	}
 
-	client.Stop()
-
-	log.Println("Orderbook data collector stopped")
+	// return []string{"GRIFFAINUSDT", "B2USDT"}, nil
+	return list, nil
 }
