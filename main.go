@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -25,7 +26,7 @@ import (
 
 const (
 	BinanceWSURL       = "wss://fstream.binance.com/ws"
-	MaxSymbolsPerConn  = 40 // [IMPORTANT] Limit symbols per socket to prevent disconnects
+	MaxSymbolsPerConn  = 40 // Limit symbols per socket to prevent disconnects
 	BatchSize          = 25 // Batch size for subscribing within a connection
 	BatchPause         = 500 * time.Millisecond
 	RawBuffer          = 100000 // buffer for aggregated traffic
@@ -50,7 +51,7 @@ var (
 	redisErrCount  int64
 )
 
-// SafeWebSocket wraps the websocket connection with a mutex for thread-safe writing
+// SafeWebSocket wraps the websocket connection with a mutex for thread-safe operations
 type SafeWebSocket struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
@@ -69,6 +70,8 @@ func (s *SafeWebSocket) WriteControl(messageType int, data []byte, deadline time
 }
 
 func (s *SafeWebSocket) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.conn.Close()
 }
 
@@ -76,6 +79,17 @@ func (s *SafeWebSocket) SetWriteDeadline(t time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.conn.SetWriteDeadline(t)
+}
+
+func (s *SafeWebSocket) SetReadDeadline(t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.SetReadDeadline(t)
+}
+
+func (s *SafeWebSocket) ReadMessage() (messageType int, p []byte, err error) {
+	// Reading doesn't need mutex - gorilla/websocket allows concurrent reads
+	return s.conn.ReadMessage()
 }
 
 type RawWSMessage struct {
@@ -187,6 +201,13 @@ func main() {
 	}
 	log.Printf("fetched %d symbols total", len(allSymbols))
 
+	// RANDOMIZE symbol distribution to avoid clustering high-volume pairs (do we really need to do so ???)
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(allSymbols), func(i, j int) {
+		allSymbols[i], allSymbols[j] = allSymbols[j], allSymbols[i]
+	})
+	log.Printf("symbols %d randomized for balanced distribution across shards", len(allSymbols))
+
 	rawChan := make(chan RawWSMessage, RawBuffer)
 	var wg sync.WaitGroup
 
@@ -195,24 +216,18 @@ func main() {
 	go printStats()
 
 	// 2. SHARDING LOGIC
-	// Split symbols into chunks and start a connection for each chunk
 	chunkCount := 0
 	for i := 0; i < len(allSymbols); i += MaxSymbolsPerConn {
 		end := i + MaxSymbolsPerConn
 		if end > len(allSymbols) {
 			end = len(allSymbols)
 		}
-
 		chunk := allSymbols[i:end]
 		chunkID := chunkCount
 		chunkCount++
 
 		log.Printf("[Main] Starting Shard %d with %d symbols", chunkID, len(chunk))
-
-		// Launch a managed connection for this specific list of symbols
 		go manageConnection(ctx, rawChan, chunk, chunkID)
-
-		// Stagger startup slightly to avoid hammering CPU/Network instantly
 		time.Sleep(200 * time.Millisecond)
 	}
 
@@ -249,7 +264,6 @@ func printStats() {
 	}
 }
 
-// manageConnection manages a SINGLE shard connection
 func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage, symbols []string, shardID int) {
 	delay := ReconnectBaseDelay
 	prefix := fmt.Sprintf("[Shard %d]", shardID)
@@ -269,6 +283,7 @@ func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage, symbols 
 			}
 			continue
 		}
+
 		log.Printf("%s connection established", prefix)
 		delay = ReconnectBaseDelay
 
@@ -278,9 +293,7 @@ func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage, symbols 
 		}()
 
 		pingTicker := time.NewTicker(PingInterval)
-		defer pingTicker.Stop()
 
-		// Pass the specific symbols for this shard
 		go func() {
 			if err := fetchAndSubscribe(conn, symbols, prefix); err != nil {
 				log.Printf("%s subscription failed: %v", prefix, err)
@@ -292,6 +305,7 @@ func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage, symbols 
 		for {
 			select {
 			case <-ctx.Done():
+				pingTicker.Stop()
 				conn.Close()
 				return
 			case <-pingTicker.C:
@@ -299,11 +313,13 @@ func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage, symbols 
 				deadline := time.Now().Add(5 * time.Second)
 				if err := conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
 					log.Printf("%s ping error: %v", prefix, err)
+					pingTicker.Stop()
 					conn.Close()
 					break loop
 				}
 			case err := <-readErrChan:
 				log.Printf("%s readLoop exited: %v", prefix, err)
+				pingTicker.Stop()
 				conn.Close()
 				break loop
 			}
@@ -324,6 +340,7 @@ func dialBinance() (*SafeWebSocket, error) {
 		ReadBufferSize:   65536,
 		WriteBufferSize:  8192,
 	}
+
 	rawConn, _, err := d.Dial(BinanceWSURL, nil)
 	if err != nil {
 		return nil, err
@@ -331,14 +348,18 @@ func dialBinance() (*SafeWebSocket, error) {
 
 	safeConn := &SafeWebSocket{conn: rawConn}
 
-	safeConn.conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+	// Set initial read deadline
+	safeConn.SetReadDeadline(time.Now().Add(ReadDeadline))
 
+	// Setup handlers - these run in read goroutine
 	safeConn.conn.SetPongHandler(func(string) error {
-		_ = safeConn.conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+		// Update read deadline when pong received
+		_ = safeConn.SetReadDeadline(time.Now().Add(ReadDeadline))
 		return nil
 	})
 
 	safeConn.conn.SetPingHandler(func(msg string) error {
+		// Respond to ping from server
 		deadline := time.Now().Add(5 * time.Second)
 		return safeConn.WriteControl(websocket.PongMessage, []byte(msg), deadline)
 	})
@@ -346,7 +367,6 @@ func dialBinance() (*SafeWebSocket, error) {
 	return safeConn, nil
 }
 
-// fetchAndSubscribe now accepts the specific list of symbols for this shard
 func fetchAndSubscribe(conn *SafeWebSocket, symbolsList []string, prefix string) error {
 	log.Printf("%s subscribing to %d symbols...", prefix, len(symbolsList))
 
@@ -381,7 +401,6 @@ func fetchAndSubscribe(conn *SafeWebSocket, symbolsList []string, prefix string)
 		}
 
 		batchCount++
-		// Minimal logging for batches to reduce noise
 		if batchCount == 1 || i+BatchSize >= len(params) {
 			log.Printf("%s sent batch %d (%d streams)", prefix, batchCount, len(batch))
 		}
@@ -396,7 +415,6 @@ func fetchAndSubscribe(conn *SafeWebSocket, symbolsList []string, prefix string)
 
 func readLoop(ctx context.Context, safeConn *SafeWebSocket, rawChan chan<- RawWSMessage, prefix string) error {
 	msgCount := 0
-	conn := safeConn.conn
 
 	for {
 		select {
@@ -405,8 +423,8 @@ func readLoop(ctx context.Context, safeConn *SafeWebSocket, rawChan chan<- RawWS
 		default:
 		}
 
-		_ = conn.SetReadDeadline(time.Now().Add(ReadDeadline))
-		_, data, err := conn.ReadMessage()
+		_ = safeConn.SetReadDeadline(time.Now().Add(ReadDeadline))
+		_, data, err := safeConn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err,
 				websocket.CloseNormalClosure,
@@ -433,7 +451,6 @@ func readLoop(ctx context.Context, safeConn *SafeWebSocket, rawChan chan<- RawWS
 		}
 
 		if looksLikeControlMessage(data) {
-			// logControlMessage(data) // Optional: uncomment if debugging control msgs
 			continue
 		}
 
@@ -457,8 +474,9 @@ func looksLikeControlMessage(b []byte) bool {
 }
 
 func startWorkers(ctx context.Context, rawChan <-chan RawWSMessage, publisher *RedisPublisher, wg *sync.WaitGroup) {
-	WorkerCount := runtime.NumCPU() * 2
+	WorkerCount := runtime.NumCPU() * 4
 	wg.Add(WorkerCount)
+
 	for i := 0; i < WorkerCount; i++ {
 		go func(id int) {
 			defer wg.Done()
@@ -535,6 +553,7 @@ func normalizeBookTicker(bt *BookTicker) (*NormalizedBookTicker, error) {
 func monitorQueue(ch chan RawWSMessage) {
 	t := time.NewTicker(QueueWarnEvery)
 	defer t.Stop()
+
 	for range t.C {
 		n := len(ch)
 		if n > RawBuffer/2 {
@@ -565,11 +584,11 @@ func symbols() ([]string, error) {
 			Symbol string `json:"symbol"`
 		} `json:"symbols"`
 	}
+
 	if err := json.Unmarshal(body, &apiResp); err != nil {
 		return nil, err
 	}
 
-	// Set of symbols to exclude using an empty struct for memory efficiency
 	excludedSymbols := map[string]struct{}{
 		"ETHUSDT":  {},
 		"SOLUSDT":  {},
@@ -579,11 +598,12 @@ func symbols() ([]string, error) {
 		"DOGEUSDT": {},
 		"LTCUSDT":  {},
 		"ADAUSDT":  {},
+		"ATOMUSDT": {},
+		"SUIUSDT":  {},
 	}
 
 	var list []string
 	for _, s := range apiResp.Symbols {
-		// Check if the symbol exists as a key in the map
 		if _, isExcluded := excludedSymbols[s.Symbol]; !isExcluded {
 			list = append(list, s.Symbol)
 		}
