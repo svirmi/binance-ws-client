@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -13,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,22 +20,63 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
-	BinanceWSURL   = "wss://fstream.binance.com/ws"
-	BatchSize      = 180
-	BatchPause     = 300 * time.Millisecond
-	RawBuffer      = 20000
-	QueueWarnEvery = 3 * time.Second
-	ReadDeadline   = 90 * time.Second
-	PingInterval   = 3 * time.Minute
-
-	ReconnectBaseDelay = 1 * time.Second
+	BinanceWSURL       = "wss://fstream.binance.com/ws"
+	MaxSymbolsPerConn  = 50 // [IMPORTANT] Limit symbols per socket to prevent disconnects
+	BatchSize          = 50 // Batch size for subscribing within a connection
+	BatchPause         = 500 * time.Millisecond
+	RawBuffer          = 65000 // buffer for aggregated traffic
+	QueueWarnEvery     = 3 * time.Second
+	ReadDeadline       = 60 * time.Second
+	PingInterval       = 3 * time.Minute
+	ReconnectBaseDelay = 2 * time.Second
 	ReconnectMaxDelay  = 30 * time.Second
+
+	// Redis configuration
+	RedisAddr       = "localhost:6379"
+	RedisPassword   = ""
+	RedisDB         = 0
+	RedisChannel    = "binance_orderbook"
+	RedisMaxRetries = 3
+	RedisPoolSize   = 10
 )
 
-var dropCounter int64
+var (
+	dropCounter    int64
+	publishCounter int64
+	redisErrCount  int64
+)
+
+// SafeWebSocket wraps the websocket connection with a mutex for thread-safe writing
+type SafeWebSocket struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (s *SafeWebSocket) WriteJSON(v interface{}) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.WriteJSON(v)
+}
+
+func (s *SafeWebSocket) WriteControl(messageType int, data []byte, deadline time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.WriteControl(messageType, data, deadline)
+}
+
+func (s *SafeWebSocket) Close() error {
+	return s.conn.Close()
+}
+
+func (s *SafeWebSocket) SetWriteDeadline(t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.SetWriteDeadline(t)
+}
 
 type RawWSMessage struct {
 	Data []byte
@@ -52,6 +93,18 @@ type BookTicker struct {
 	TransTs   int64  `json:"T"`
 }
 
+type NormalizedBookTicker struct {
+	Exchange      string  `json:"exchange"`
+	Symbol        string  `json:"symbol"`
+	BidPrice      float64 `json:"bid_price"`
+	BidQty        float64 `json:"bid_qty"`
+	AskPrice      float64 `json:"ask_price"`
+	AskQty        float64 `json:"ask_qty"`
+	Timestamp     int64   `json:"timestamp"`
+	ReceivedAt    int64   `json:"received_at"`
+	OriginalEvent string  `json:"original_event"`
+}
+
 type ControlMsg struct {
 	Result interface{} `json:"result"`
 	ID     int64       `json:"id"`
@@ -61,46 +114,154 @@ type ControlMsg struct {
 	} `json:"error"`
 }
 
+type RedisPublisher struct {
+	client  *redis.Client
+	channel string
+	mu      sync.Mutex
+}
+
+func NewRedisPublisher(addr, password, channel string, db int) (*RedisPublisher, error) {
+	client := redis.NewClient(&redis.Options{
+		Addr:         addr,
+		Password:     password,
+		DB:           db,
+		MaxRetries:   RedisMaxRetries,
+		PoolSize:     RedisPoolSize,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("redis connection failed: %w", err)
+	}
+
+	log.Printf("Redis connected successfully to %s", addr)
+	return &RedisPublisher{
+		client:  client,
+		channel: channel,
+	}, nil
+}
+
+func (rp *RedisPublisher) Publish(ctx context.Context, data *NormalizedBookTicker) error {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("json marshal error: %w", err)
+	}
+
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+
+	if err := rp.client.Publish(ctx, rp.channel, payload).Err(); err != nil {
+		atomic.AddInt64(&redisErrCount, 1)
+		return fmt.Errorf("redis publish error: %w", err)
+	}
+
+	atomic.AddInt64(&publishCounter, 1)
+	return nil
+}
+
+func (rp *RedisPublisher) Close() error {
+	return rp.client.Close()
+}
+
 func main() {
-	log.Println("starting binance client")
+	log.Println("starting binance -> redis publisher (SHARDED MODE)")
+
+	publisher, err := NewRedisPublisher(RedisAddr, RedisPassword, RedisChannel, RedisDB)
+	if err != nil {
+		log.Fatalf("failed to initialize redis: %v", err)
+	}
+	defer publisher.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// 1. Fetch symbols ONCE at startup
+	allSymbols, err := symbols()
+	if err != nil {
+		log.Fatalf("failed to fetch symbols: %v", err)
+	}
+	log.Printf("fetched %d symbols total", len(allSymbols))
+
 	rawChan := make(chan RawWSMessage, RawBuffer)
 	var wg sync.WaitGroup
 
-	// start workers
-	startWorkers(ctx, rawChan, &wg)
+	startWorkers(ctx, rawChan, publisher, &wg)
 	go monitorQueue(rawChan)
+	go printStats()
 
-	// managed connection: read, ping, reconnect
-	go manageConnection(ctx, rawChan)
+	// 2. SHARDING LOGIC
+	// Split symbols into chunks and start a connection for each chunk
+	chunkCount := 0
+	for i := 0; i < len(allSymbols); i += MaxSymbolsPerConn {
+		end := i + MaxSymbolsPerConn
+		if end > len(allSymbols) {
+			end = len(allSymbols)
+		}
 
-	// graceful shutdown
+		chunk := allSymbols[i:end]
+		chunkID := chunkCount
+		chunkCount++
+
+		log.Printf("[Main] Starting Shard %d with %d symbols", chunkID, len(chunk))
+
+		// Launch a managed connection for this specific list of symbols
+		go manageConnection(ctx, rawChan, chunk, chunkID)
+
+		// Stagger startup slightly to avoid hammering CPU/Network instantly
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	log.Printf("All %d shards started", chunkCount)
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Println("shutdown signal received")
 	cancel()
-
 	wg.Wait()
-	log.Printf("FINAL STATS: dropped=%d", atomic.LoadInt64(&dropCounter))
+	log.Printf("FINAL STATS: dropped=%d published=%d redis_errors=%d",
+		atomic.LoadInt64(&dropCounter),
+		atomic.LoadInt64(&publishCounter),
+		atomic.LoadInt64(&redisErrCount))
 	log.Println("exited")
 }
 
-// manageConnection keeps the websocket alive with auto-reconnect and heartbeat
-func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage) {
+func printStats() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	lastPublished := int64(0)
+
+	for range ticker.C {
+		published := atomic.LoadInt64(&publishCounter)
+		dropped := atomic.LoadInt64(&dropCounter)
+		redisErrs := atomic.LoadInt64(&redisErrCount)
+		rate := (published - lastPublished) / 10
+
+		log.Printf("STATS: published=%d (%.1f/s) dropped=%d redis_errors=%d",
+			published, float64(rate), dropped, redisErrs)
+		lastPublished = published
+	}
+}
+
+// manageConnection manages a SINGLE shard connection
+func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage, symbols []string, shardID int) {
 	delay := ReconnectBaseDelay
+	prefix := fmt.Sprintf("[Shard %d]", shardID)
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		conn, err := connectAndSubscribe()
+		conn, err := dialBinance()
 		if err != nil {
-			log.Printf("connect/subscribe failed: %v", err)
+			log.Printf("%s dial failed: %v", prefix, err)
 			time.Sleep(delay)
 			delay *= 2
 			if delay > ReconnectMaxDelay {
@@ -108,43 +269,47 @@ func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage) {
 			}
 			continue
 		}
-		log.Println("connection established")
+		log.Printf("%s connection established", prefix)
 		delay = ReconnectBaseDelay
 
-		// ping ticker
+		readErrChan := make(chan error, 1)
+		go func() {
+			readErrChan <- readLoop(ctx, conn, rawChan, prefix)
+		}()
+
 		pingTicker := time.NewTicker(PingInterval)
 		defer pingTicker.Stop()
 
-		readErrChan := make(chan error, 1)
-
-		// read loop
+		// Pass the specific symbols for this shard
 		go func() {
-			readErrChan <- readLoop(ctx, conn, rawChan)
+			if err := fetchAndSubscribe(conn, symbols, prefix); err != nil {
+				log.Printf("%s subscription failed: %v", prefix, err)
+				conn.Close()
+			}
 		}()
 
 	loop:
 		for {
 			select {
 			case <-ctx.Done():
-				log.Println("context canceled, closing connection")
 				conn.Close()
 				return
 			case <-pingTicker.C:
 				payload := []byte(fmt.Sprintf("%d", time.Now().UnixMilli()))
 				deadline := time.Now().Add(5 * time.Second)
 				if err := conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
-					log.Printf("ping error: %v", err)
+					log.Printf("%s ping error: %v", prefix, err)
 					conn.Close()
 					break loop
 				}
 			case err := <-readErrChan:
-				log.Printf("readLoop exited: %v", err)
+				log.Printf("%s readLoop exited: %v", prefix, err)
 				conn.Close()
 				break loop
 			}
 		}
 
-		log.Printf("reconnecting in %s...", delay)
+		log.Printf("%s reconnecting in %s...", prefix, delay)
 		time.Sleep(delay)
 		delay *= 2
 		if delay > ReconnectMaxDelay {
@@ -153,29 +318,38 @@ func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage) {
 	}
 }
 
-// connectAndSubscribe establishes a websocket connection and subscribes to streams
-func connectAndSubscribe() (*websocket.Conn, error) {
-	d := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-	conn, _, err := d.Dial(BinanceWSURL, nil)
+func dialBinance() (*SafeWebSocket, error) {
+	d := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		ReadBufferSize:   65536,
+		WriteBufferSize:  8192,
+	}
+	rawConn, _, err := d.Dial(BinanceWSURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	conn.SetReadDeadline(time.Now().Add(ReadDeadline))
-	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+	safeConn := &SafeWebSocket{conn: rawConn}
+
+	safeConn.conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+
+	safeConn.conn.SetPongHandler(func(string) error {
+		_ = safeConn.conn.SetReadDeadline(time.Now().Add(ReadDeadline))
 		return nil
 	})
-	conn.SetPingHandler(func(msg string) error {
+
+	safeConn.conn.SetPingHandler(func(msg string) error {
 		deadline := time.Now().Add(5 * time.Second)
-		return conn.WriteControl(websocket.PongMessage, []byte(msg), deadline)
+		return safeConn.WriteControl(websocket.PongMessage, []byte(msg), deadline)
 	})
 
-	symbolsList, err := symbols()
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to fetch symbols: %w", err)
-	}
+	return safeConn, nil
+}
+
+// fetchAndSubscribe now accepts the specific list of symbols for this shard
+func fetchAndSubscribe(conn *SafeWebSocket, symbolsList []string, prefix string) error {
+	log.Printf("%s subscribing to %d symbols...", prefix, len(symbolsList))
+
 	symbolsLower := make([]string, len(symbolsList))
 	for i, s := range symbolsList {
 		symbolsLower[i] = strings.ToLower(s)
@@ -186,38 +360,44 @@ func connectAndSubscribe() (*websocket.Conn, error) {
 		params = append(params, s+"@bookTicker")
 	}
 
-	if err := subscribeInBatches(conn, params); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	return conn, nil
-}
-
-func subscribeInBatches(conn *websocket.Conn, params []string) error {
+	batchCount := 0
 	for i := 0; i < len(params); i += BatchSize {
 		end := i + BatchSize
 		if end > len(params) {
 			end = len(params)
 		}
 		batch := params[i:end]
+
 		msg := map[string]interface{}{
 			"method": "SUBSCRIBE",
 			"params": batch,
 			"id":     time.Now().UnixNano(),
 		}
+
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
 		if err := conn.WriteJSON(msg); err != nil {
-			log.Printf("ERROR sending subscribe batch: %v", err)
 			return fmt.Errorf("failed to send subscribe batch: %w", err)
 		}
-		log.Printf("subscribe batch sent (%d streams)", len(batch))
-		time.Sleep(BatchPause)
+
+		batchCount++
+		// Minimal logging for batches to reduce noise
+		if batchCount == 1 || i+BatchSize >= len(params) {
+			log.Printf("%s sent batch %d (%d streams)", prefix, batchCount, len(batch))
+		}
+
+		if i+BatchSize < len(params) {
+			time.Sleep(BatchPause)
+		}
 	}
+
 	return nil
 }
 
-// readLoop reads messages and pushes to rawChan
-func readLoop(ctx context.Context, conn *websocket.Conn, rawChan chan<- RawWSMessage) error {
+func readLoop(ctx context.Context, safeConn *SafeWebSocket, rawChan chan<- RawWSMessage, prefix string) error {
+	msgCount := 0
+	conn := safeConn.conn
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -228,9 +408,17 @@ func readLoop(ctx context.Context, conn *websocket.Conn, rawChan chan<- RawWSMes
 		_ = conn.SetReadDeadline(time.Now().Add(ReadDeadline))
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
-				strings.Contains(err.Error(), "use of closed network connection") {
+			if websocket.IsCloseError(err,
+				websocket.CloseNormalClosure,
+				websocket.CloseGoingAway,
+				websocket.CloseAbnormalClosure) {
+				return fmt.Errorf("connection closed: %w", err)
+			}
+			if strings.Contains(err.Error(), "use of closed network connection") {
 				return fmt.Errorf("connection closed")
+			}
+			if strings.Contains(err.Error(), "EOF") {
+				return fmt.Errorf("unexpected EOF - connection dropped by server")
 			}
 			if isTemporaryNetErr(err) {
 				time.Sleep(100 * time.Millisecond)
@@ -239,8 +427,13 @@ func readLoop(ctx context.Context, conn *websocket.Conn, rawChan chan<- RawWSMes
 			return fmt.Errorf("read error: %w", err)
 		}
 
+		msgCount++
+		if msgCount == 1 {
+			log.Printf("%s first message received", prefix)
+		}
+
 		if looksLikeControlMessage(data) {
-			logControlMessage(data)
+			// logControlMessage(data) // Optional: uncomment if debugging control msgs
 			continue
 		}
 
@@ -263,54 +456,80 @@ func looksLikeControlMessage(b []byte) bool {
 	return len(b) > 0 && (bytes.Contains(b, []byte(`"result"`)) || bytes.Contains(b, []byte(`"error"`)))
 }
 
-func logControlMessage(b []byte) {
-	var m ControlMsg
-	if err := json.Unmarshal(b, &m); err != nil {
-		log.Printf("control message (unparseable): %s", string(b))
-		return
-	}
-	if m.Error != nil {
-		log.Printf("CONTROL ERROR: code=%d msg=%s", m.Error.Code, m.Error.Msg)
-		return
-	}
-	log.Printf("CONTROL OK: id=%d result=%v", m.ID, m.Result)
-}
-
-func startWorkers(ctx context.Context, rawChan <-chan RawWSMessage, wg *sync.WaitGroup) {
-	WorkerCount := runtime.NumCPU()
+func startWorkers(ctx context.Context, rawChan <-chan RawWSMessage, publisher *RedisPublisher, wg *sync.WaitGroup) {
+	WorkerCount := runtime.NumCPU() * 4
 	wg.Add(WorkerCount)
 	for i := 0; i < WorkerCount; i++ {
 		go func(id int) {
 			defer wg.Done()
-			log.Printf("worker %d started", id)
 			for {
 				select {
 				case <-ctx.Done():
-					log.Printf("worker %d exiting (ctx canceled)", id)
 					return
 				case raw, ok := <-rawChan:
 					if !ok {
-						log.Printf("worker %d exiting (channel closed)", id)
 						return
 					}
-					processRaw(raw.Data)
+					processAndPublish(ctx, raw.Data, publisher)
 				}
 			}
 		}(i)
 	}
 }
 
-func processRaw(b []byte) {
+func processAndPublish(ctx context.Context, b []byte, publisher *RedisPublisher) {
 	var bt BookTicker
 	if err := json.Unmarshal(b, &bt); err != nil {
 		return
 	}
-	ts := time.Now()
-	if bt.EventTime > 0 {
-		ts = time.Unix(0, bt.EventTime*int64(time.Millisecond))
+
+	normalized, err := normalizeBookTicker(&bt)
+	if err != nil {
+		return
 	}
-	log.Printf("%s | bid=%s qty=%s | ask=%s qty=%s | %s",
-		bt.Symbol, bt.BidPrice, bt.BidQty, bt.AskPrice, bt.AskQty, ts.Format("15:04:05.000"))
+
+	if err := publisher.Publish(ctx, normalized); err != nil {
+		// Suppress log noise, rely on stats
+	}
+}
+
+func normalizeBookTicker(bt *BookTicker) (*NormalizedBookTicker, error) {
+	bidPrice, err := strconv.ParseFloat(bt.BidPrice, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid bid price")
+	}
+
+	bidQty, err := strconv.ParseFloat(bt.BidQty, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid bid qty")
+	}
+
+	askPrice, err := strconv.ParseFloat(bt.AskPrice, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ask price")
+	}
+
+	askQty, err := strconv.ParseFloat(bt.AskQty, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ask qty")
+	}
+
+	timestamp := bt.EventTime
+	if timestamp == 0 && bt.TransTs > 0 {
+		timestamp = bt.TransTs
+	}
+
+	return &NormalizedBookTicker{
+		Exchange:      "binance",
+		Symbol:        bt.Symbol,
+		BidPrice:      bidPrice,
+		BidQty:        bidQty,
+		AskPrice:      askPrice,
+		AskQty:        askQty,
+		Timestamp:     timestamp,
+		ReceivedAt:    time.Now().UnixMilli(),
+		OriginalEvent: bt.EventType,
+	}, nil
 }
 
 func monitorQueue(ch chan RawWSMessage) {
@@ -324,7 +543,6 @@ func monitorQueue(ch chan RawWSMessage) {
 	}
 }
 
-// symbols fetches symbols from external API
 func symbols() ([]string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get("http://152.70.55.44:8080/intersection/futures")
@@ -355,7 +573,5 @@ func symbols() ([]string, error) {
 	for i, s := range apiResp.Symbols {
 		list[i] = s.Symbol
 	}
-
-	// return []string{"GRIFFAINUSDT", "B2USDT"}, nil
 	return list, nil
 }
