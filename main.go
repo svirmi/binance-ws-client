@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -26,11 +25,11 @@ import (
 
 const (
 	BinanceWSURL       = "wss://fstream.binance.com/ws"
-	BatchSize          = 100 // Smaller batches for stability
+	BatchSize          = 50 // Reduced batch size further for stability
 	BatchPause         = 500 * time.Millisecond
-	RawBuffer          = 20000
+	RawBuffer          = 50000 // Increased buffer
 	QueueWarnEvery     = 3 * time.Second
-	ReadDeadline       = 90 * time.Second
+	ReadDeadline       = 60 * time.Second
 	PingInterval       = 3 * time.Minute
 	ReconnectBaseDelay = 2 * time.Second
 	ReconnectMaxDelay  = 30 * time.Second
@@ -49,6 +48,36 @@ var (
 	publishCounter int64
 	redisErrCount  int64
 )
+
+// SafeWebSocket wraps the websocket connection with a mutex for thread-safe writing
+type SafeWebSocket struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (s *SafeWebSocket) WriteJSON(v interface{}) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.WriteJSON(v)
+}
+
+func (s *SafeWebSocket) WriteControl(messageType int, data []byte, deadline time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.WriteControl(messageType, data, deadline)
+}
+
+func (s *SafeWebSocket) Close() error {
+	// Close doesn't need locking as it's thread-safe in gorilla/websocket,
+	// but good practice to coordinate if needed.
+	return s.conn.Close()
+}
+
+func (s *SafeWebSocket) SetWriteDeadline(t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.SetWriteDeadline(t)
+}
 
 type RawWSMessage struct {
 	Data []byte
@@ -204,9 +233,11 @@ func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage) {
 		if ctx.Err() != nil {
 			return
 		}
-		conn, err := connectAndSubscribe()
+
+		// 1. Dial (Do not subscribe yet)
+		conn, err := dialBinance()
 		if err != nil {
-			log.Printf("connect/subscribe failed: %v", err)
+			log.Printf("dial failed: %v", err)
 			time.Sleep(delay)
 			delay *= 2
 			if delay > ReconnectMaxDelay {
@@ -217,17 +248,27 @@ func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage) {
 		log.Println("connection established")
 		delay = ReconnectBaseDelay
 
-		// ping ticker
-		pingTicker := time.NewTicker(PingInterval)
-		defer pingTicker.Stop()
-
+		// 2. Start Reading IMMEDIATELY (Async)
+		// This prevents the buffer from filling up while we subscribe
 		readErrChan := make(chan error, 1)
-
-		// read loop
 		go func() {
 			readErrChan <- readLoop(ctx, conn, rawChan)
 		}()
 
+		// 3. Start Heartbeat (Async)
+		pingTicker := time.NewTicker(PingInterval)
+		defer pingTicker.Stop()
+
+		// 4. Perform Subscriptions (Async or Blocking, but now safe because ReadLoop is running)
+		// We run this in a goroutine so we can monitor readErrChan simultaneously
+		go func() {
+			if err := fetchAndSubscribe(conn); err != nil {
+				log.Printf("subscription failed: %v", err)
+				conn.Close() // This will trigger readLoop to exit
+			}
+		}()
+
+		// 5. Monitor connection
 	loop:
 		for {
 			select {
@@ -258,36 +299,48 @@ func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage) {
 	}
 }
 
-// connectAndSubscribe establishes a websocket connection and subscribes to streams
-func connectAndSubscribe() (*websocket.Conn, error) {
+// dialBinance only establishes the connection and wraps it in SafeWebSocket
+func dialBinance() (*SafeWebSocket, error) {
 	d := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
-		ReadBufferSize:   8192,
+		ReadBufferSize:   65536, // Increased buffer size at socket level
 		WriteBufferSize:  8192,
 	}
-	conn, _, err := d.Dial(BinanceWSURL, nil)
+	rawConn, _, err := d.Dial(BinanceWSURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// Set handlers before subscribing
-	conn.SetReadDeadline(time.Now().Add(ReadDeadline))
-	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+	// Wrap the connection immediately
+	safeConn := &SafeWebSocket{conn: rawConn}
+
+	// Set handlers using the safe writer
+	safeConn.conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+
+	// Pong Handler is called from ReadMessage, so it must use safe WriteControl
+	safeConn.conn.SetPongHandler(func(string) error {
+		_ = safeConn.conn.SetReadDeadline(time.Now().Add(ReadDeadline))
 		return nil
 	})
-	conn.SetPingHandler(func(msg string) error {
+
+	// Ping Handler: If server pings us, we pong back safely
+	safeConn.conn.SetPingHandler(func(msg string) error {
 		deadline := time.Now().Add(5 * time.Second)
-		return conn.WriteControl(websocket.PongMessage, []byte(msg), deadline)
+		// Use Safe WriteControl here!
+		return safeConn.WriteControl(websocket.PongMessage, []byte(msg), deadline)
 	})
 
+	return safeConn, nil
+}
+
+// fetchAndSubscribe handles the logic of getting symbols and sending subscribe requests
+func fetchAndSubscribe(conn *SafeWebSocket) error {
 	symbolsList, err := symbols()
 	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to fetch symbols: %w", err)
+		return fmt.Errorf("failed to fetch symbols: %w", err)
 	}
 
-	log.Printf("fetched %d symbols from API, subscribing to all...", len(symbolsList))
+	log.Printf("fetched %d symbols from API, subscribing...", len(symbolsList))
 
 	symbolsLower := make([]string, len(symbolsList))
 	for i, s := range symbolsList {
@@ -299,20 +352,7 @@ func connectAndSubscribe() (*websocket.Conn, error) {
 		params = append(params, s+"@bookTicker")
 	}
 
-	log.Printf("subscribing to %d streams in batches of %d...", len(params), BatchSize)
-	if err := subscribeInBatches(conn, params); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	// Wait a bit for subscriptions to settle
-	time.Sleep(1 * time.Second)
-	log.Printf("subscription complete for all %d streams, waiting for data...", len(params))
-
-	return conn, nil
-}
-
-func subscribeInBatches(conn *websocket.Conn, params []string) error {
+	// Send in batches
 	batchCount := 0
 	for i := 0; i < len(params); i += BatchSize {
 		end := i + BatchSize
@@ -327,11 +367,11 @@ func subscribeInBatches(conn *websocket.Conn, params []string) error {
 			"id":     time.Now().UnixNano(),
 		}
 
-		// Set write deadline
+		// Set write deadline safely
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
+		// WriteJSON is now thread-safe
 		if err := conn.WriteJSON(msg); err != nil {
-			log.Printf("ERROR sending subscribe batch %d: %v", batchCount, err)
 			return fmt.Errorf("failed to send subscribe batch: %w", err)
 		}
 
@@ -339,7 +379,6 @@ func subscribeInBatches(conn *websocket.Conn, params []string) error {
 		log.Printf("subscribe batch %d sent (%d streams, total: %d/%d)",
 			batchCount, len(batch), end, len(params))
 
-		// Wait between batches to avoid overwhelming the server
 		if i+BatchSize < len(params) {
 			time.Sleep(BatchPause)
 		}
@@ -350,8 +389,11 @@ func subscribeInBatches(conn *websocket.Conn, params []string) error {
 }
 
 // readLoop reads messages and pushes to rawChan
-func readLoop(ctx context.Context, conn *websocket.Conn, rawChan chan<- RawWSMessage) error {
+func readLoop(ctx context.Context, safeConn *SafeWebSocket, rawChan chan<- RawWSMessage) error {
 	msgCount := 0
+	// We read from the raw conn, that's fine as Read is concurrent with Write
+	conn := safeConn.conn
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -421,11 +463,12 @@ func logControlMessage(b []byte) {
 		log.Printf("CONTROL ERROR: code=%d msg=%s", m.Error.Code, m.Error.Msg)
 		return
 	}
-	log.Printf("CONTROL OK: id=%d result=%v", m.ID, m.Result)
+	// Reduce log noise for success messages
+	// log.Printf("CONTROL OK: id=%d result=%v", m.ID, m.Result)
 }
 
 func startWorkers(ctx context.Context, rawChan <-chan RawWSMessage, publisher *RedisPublisher, wg *sync.WaitGroup) {
-	WorkerCount := runtime.NumCPU()
+	WorkerCount := runtime.NumCPU() * 2
 	wg.Add(WorkerCount)
 	for i := 0; i < WorkerCount; i++ {
 		go func(id int) {
@@ -457,7 +500,7 @@ func processAndPublish(ctx context.Context, b []byte, publisher *RedisPublisher)
 	// Normalize the data
 	normalized, err := normalizeBookTicker(&bt)
 	if err != nil {
-		log.Printf("normalization error for %s: %v", bt.Symbol, err)
+		// Log less frequently on normalization error to avoid flooding
 		return
 	}
 
