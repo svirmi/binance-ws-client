@@ -1,337 +1,552 @@
-// File: main.go
+// main.go
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 )
 
-// ------------------------------------------------------------------
-//
-//	Normalized Quote Struct (common format for all exchanges)
-//
-// ------------------------------------------------------------------
-type NormalizedQuote struct {
-	Exchange  string    `json:"exchange"`
-	Symbol    string    `json:"symbol"`
-	BidPrice  float64   `json:"bid_price"`
-	BidSize   float64   `json:"bid_size"`
-	AskPrice  float64   `json:"ask_price"`
-	AskSize   float64   `json:"ask_size"`
-	Timestamp time.Time `json:"timestamp"`
+const (
+	BinanceWSURL       = "wss://fstream.binance.com/ws"
+	BatchSize          = 100 // Smaller batches for stability
+	BatchPause         = 500 * time.Millisecond
+	RawBuffer          = 20000
+	QueueWarnEvery     = 3 * time.Second
+	ReadDeadline       = 90 * time.Second
+	PingInterval       = 3 * time.Minute
+	ReconnectBaseDelay = 2 * time.Second
+	ReconnectMaxDelay  = 30 * time.Second
+
+	// Redis configuration
+	RedisAddr       = "localhost:6379"
+	RedisPassword   = ""
+	RedisDB         = 0
+	RedisChannel    = "book_tickers" // Channel for normalized data
+	RedisMaxRetries = 3
+	RedisPoolSize   = 10
+)
+
+var (
+	dropCounter    int64
+	publishCounter int64
+	redisErrCount  int64
+)
+
+type RawWSMessage struct {
+	Data []byte
 }
 
-// ------------------------------------------------------------------
-// Binance Raw BookTicker Message
-// ------------------------------------------------------------------
-type BinanceBookTicker struct {
-	Symbol   string `json:"s"`
-	BidPrice string `json:"b"`
-	BidQty   string `json:"B"`
-	AskPrice string `json:"a"`
-	AskQty   string `json:"A"`
-	Time     int64  `json:"T"`
+type BookTicker struct {
+	EventType string `json:"e"`
+	EventTime int64  `json:"E"`
+	Symbol    string `json:"s"`
+	BidPrice  string `json:"b"`
+	BidQty    string `json:"B"`
+	AskPrice  string `json:"a"`
+	AskQty    string `json:"A"`
+	TransTs   int64  `json:"T"`
 }
 
-// ------------------------------------------------------------------
-// Normalizer for Binance → NormalizedQuote
-// ------------------------------------------------------------------
-func NormalizeBinanceBookTicker(msg BinanceBookTicker) (NormalizedQuote, error) {
-	var nq NormalizedQuote
-	nq.Exchange = "binance"
-	nq.Symbol = msg.Symbol
-
-	var err error
-	if nq.BidPrice, err = parseFloat(msg.BidPrice); err != nil {
-		return nq, fmt.Errorf("invalid bid price: %w", err)
-	}
-	if nq.AskPrice, err = parseFloat(msg.AskPrice); err != nil {
-		return nq, fmt.Errorf("invalid ask price: %w", err)
-	}
-	if nq.BidSize, err = parseFloat(msg.BidQty); err != nil {
-		return nq, fmt.Errorf("invalid bid qty: %w", err)
-	}
-	if nq.AskSize, err = parseFloat(msg.AskQty); err != nil {
-		return nq, fmt.Errorf("invalid ask qty: %w", err)
-	}
-
-	// Event time T is transaction time in ms; convert to time.Time safely
-	if msg.Time > 0 {
-		nq.Timestamp = time.UnixMilli(msg.Time)
-	} else {
-		nq.Timestamp = time.Now()
-	}
-	return nq, nil
+// NormalizedBookTicker is the unified format for all exchanges
+type NormalizedBookTicker struct {
+	Exchange      string  `json:"exchange"`
+	Symbol        string  `json:"symbol"`
+	BidPrice      float64 `json:"bid_price"`
+	BidQty        float64 `json:"bid_qty"`
+	AskPrice      float64 `json:"ask_price"`
+	AskQty        float64 `json:"ask_qty"`
+	Timestamp     int64   `json:"timestamp"`      // Unix milliseconds
+	ReceivedAt    int64   `json:"received_at"`    // Unix milliseconds when we received it
+	OriginalEvent string  `json:"original_event"` // For debugging
 }
 
-func parseFloat(s string) (float64, error) {
-	return strconv.ParseFloat(s, 64)
+type ControlMsg struct {
+	Result interface{} `json:"result"`
+	ID     int64       `json:"id"`
+	Error  *struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	} `json:"error"`
 }
 
-// ------------------------------------------------------------------
-// Collector
-// ------------------------------------------------------------------
-
-type Collector struct {
-	wsURL       string
-	symbols     []string
-	rawRead     int64
-	processed   int64
-	dropped     int64
-	workerCount int
-	msgCh       chan []byte
+type RedisPublisher struct {
+	client  *redis.Client
+	channel string
+	mu      sync.Mutex
 }
 
-// ------------------------------------------------------------------
+func NewRedisPublisher(addr, password, channel string, db int) (*RedisPublisher, error) {
+	client := redis.NewClient(&redis.Options{
+		Addr:         addr,
+		Password:     password,
+		DB:           db,
+		MaxRetries:   RedisMaxRetries,
+		PoolSize:     RedisPoolSize,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	})
 
-func NewCollector(wsURL string, symbols []string, workerCount int, buffer int) *Collector {
-	return &Collector{
-		wsURL:       wsURL,
-		symbols:     symbols,
-		workerCount: workerCount,
-		msgCh:       make(chan []byte, buffer),
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("redis connection failed: %w", err)
+	}
+
+	log.Printf("Redis connected successfully to %s", addr)
+	return &RedisPublisher{
+		client:  client,
+		channel: channel,
+	}, nil
+}
+
+func (rp *RedisPublisher) Publish(ctx context.Context, data *NormalizedBookTicker) error {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("json marshal error: %w", err)
+	}
+
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+
+	if err := rp.client.Publish(ctx, rp.channel, payload).Err(); err != nil {
+		atomic.AddInt64(&redisErrCount, 1)
+		return fmt.Errorf("redis publish error: %w", err)
+	}
+
+	atomic.AddInt64(&publishCounter, 1)
+	return nil
+}
+
+func (rp *RedisPublisher) Close() error {
+	return rp.client.Close()
+}
+
+func main() {
+	log.Println("starting binance -> redis publisher")
+
+	// Initialize Redis publisher
+	publisher, err := NewRedisPublisher(RedisAddr, RedisPassword, RedisChannel, RedisDB)
+	if err != nil {
+		log.Fatalf("failed to initialize redis: %v", err)
+	}
+	defer publisher.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rawChan := make(chan RawWSMessage, RawBuffer)
+	var wg sync.WaitGroup
+
+	// Start workers with Redis publisher
+	startWorkers(ctx, rawChan, publisher, &wg)
+	go monitorQueue(rawChan)
+	go printStats()
+
+	// Managed connection: read, ping, reconnect
+	go manageConnection(ctx, rawChan)
+
+	// Graceful shutdown
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	log.Println("shutdown signal received")
+	cancel()
+	wg.Wait()
+	log.Printf("FINAL STATS: dropped=%d published=%d redis_errors=%d",
+		atomic.LoadInt64(&dropCounter),
+		atomic.LoadInt64(&publishCounter),
+		atomic.LoadInt64(&redisErrCount))
+	log.Println("exited")
+}
+
+func printStats() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	lastPublished := int64(0)
+
+	for range ticker.C {
+		published := atomic.LoadInt64(&publishCounter)
+		dropped := atomic.LoadInt64(&dropCounter)
+		redisErrs := atomic.LoadInt64(&redisErrCount)
+		rate := (published - lastPublished) / 10
+
+		log.Printf("STATS: published=%d (%.1f/s) dropped=%d redis_errors=%d",
+			published, float64(rate), dropped, redisErrs)
+		lastPublished = published
 	}
 }
 
-// ------------------------------------------------------------------
+// manageConnection keeps the websocket alive with auto-reconnect and heartbeat
+func manageConnection(ctx context.Context, rawChan chan<- RawWSMessage) {
+	delay := ReconnectBaseDelay
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		conn, err := connectAndSubscribe()
+		if err != nil {
+			log.Printf("connect/subscribe failed: %v", err)
+			time.Sleep(delay)
+			delay *= 2
+			if delay > ReconnectMaxDelay {
+				delay = ReconnectMaxDelay
+			}
+			continue
+		}
+		log.Println("connection established")
+		delay = ReconnectBaseDelay
 
-func (c *Collector) connect() (*websocket.Conn, error) {
-	dialer := websocket.Dialer{
-		Proxy:            http.ProxyFromEnvironment,
+		// ping ticker
+		pingTicker := time.NewTicker(PingInterval)
+		defer pingTicker.Stop()
+
+		readErrChan := make(chan error, 1)
+
+		// read loop
+		go func() {
+			readErrChan <- readLoop(ctx, conn, rawChan)
+		}()
+
+	loop:
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("context canceled, closing connection")
+				conn.Close()
+				return
+			case <-pingTicker.C:
+				payload := []byte(fmt.Sprintf("%d", time.Now().UnixMilli()))
+				deadline := time.Now().Add(5 * time.Second)
+				if err := conn.WriteControl(websocket.PingMessage, payload, deadline); err != nil {
+					log.Printf("ping error: %v", err)
+					conn.Close()
+					break loop
+				}
+			case err := <-readErrChan:
+				log.Printf("readLoop exited: %v", err)
+				conn.Close()
+				break loop
+			}
+		}
+		log.Printf("reconnecting in %s...", delay)
+		time.Sleep(delay)
+		delay *= 2
+		if delay > ReconnectMaxDelay {
+			delay = ReconnectMaxDelay
+		}
+	}
+}
+
+// connectAndSubscribe establishes a websocket connection and subscribes to streams
+func connectAndSubscribe() (*websocket.Conn, error) {
+	d := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
-		NetDialContext: (&net.Dialer{
-			Timeout: 10 * time.Second,
-		}).DialContext,
+		ReadBufferSize:   8192,
+		WriteBufferSize:  8192,
 	}
-
-	conn, _, err := dialer.Dial(c.wsURL, nil)
+	conn, _, err := d.Dial(BinanceWSURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
+	// Set handlers before subscribing
+	conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+		return nil
+	})
+	conn.SetPingHandler(func(msg string) error {
+		deadline := time.Now().Add(5 * time.Second)
+		return conn.WriteControl(websocket.PongMessage, []byte(msg), deadline)
+	})
+
+	symbolsList, err := symbols()
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to fetch symbols: %w", err)
+	}
+
+	log.Printf("fetched %d symbols from API, subscribing to all...", len(symbolsList))
+
+	symbolsLower := make([]string, len(symbolsList))
+	for i, s := range symbolsList {
+		symbolsLower[i] = strings.ToLower(s)
+	}
+
+	params := make([]string, 0, len(symbolsLower))
+	for _, s := range symbolsLower {
+		params = append(params, s+"@bookTicker")
+	}
+
+	log.Printf("subscribing to %d streams in batches of %d...", len(params), BatchSize)
+	if err := subscribeInBatches(conn, params); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	// Wait a bit for subscriptions to settle
+	time.Sleep(1 * time.Second)
+	log.Printf("subscription complete for all %d streams, waiting for data...", len(params))
+
 	return conn, nil
 }
 
-// ------------------------------------------------------------------
-// Subscribe
-// ------------------------------------------------------------------
+func subscribeInBatches(conn *websocket.Conn, params []string) error {
+	batchCount := 0
+	for i := 0; i < len(params); i += BatchSize {
+		end := i + BatchSize
+		if end > len(params) {
+			end = len(params)
+		}
+		batch := params[i:end]
 
-func (c *Collector) subscribe(conn *websocket.Conn) error {
-	type subReq struct {
-		Method string   `json:"method"`
-		Params []string `json:"params"`
-		ID     int      `json:"id"`
+		msg := map[string]interface{}{
+			"method": "SUBSCRIBE",
+			"params": batch,
+			"id":     time.Now().UnixNano(),
+		}
+
+		// Set write deadline
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
+		if err := conn.WriteJSON(msg); err != nil {
+			log.Printf("ERROR sending subscribe batch %d: %v", batchCount, err)
+			return fmt.Errorf("failed to send subscribe batch: %w", err)
+		}
+
+		batchCount++
+		log.Printf("subscribe batch %d sent (%d streams, total: %d/%d)",
+			batchCount, len(batch), end, len(params))
+
+		// Wait between batches to avoid overwhelming the server
+		if i+BatchSize < len(params) {
+			time.Sleep(BatchPause)
+		}
 	}
 
-	var params []string
-	for _, s := range c.symbols {
-		// Binance expects lowercase stream names
-		params = append(params, fmt.Sprintf("%s@bookTicker", strings.ToLower(s)))
-	}
-
-	req := subReq{
-		Method: "SUBSCRIBE",
-		Params: params,
-		ID:     1,
-	}
-
-	if err := conn.WriteJSON(req); err != nil {
-		return err
-	}
-	log.Printf("subscribe request sent for %d streams", len(params))
+	log.Printf("all %d batches sent successfully", batchCount)
 	return nil
 }
 
-// ------------------------------------------------------------------
-
-func (c *Collector) readLoop(ctx context.Context, conn *websocket.Conn) error {
+// readLoop reads messages and pushes to rawChan
+func readLoop(ctx context.Context, conn *websocket.Conn, rawChan chan<- RawWSMessage) error {
+	msgCount := 0
 	for {
-		// Respect ctx cancellation by checking before each read attempt
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("context canceled")
 		default:
 		}
 
+		_ = conn.SetReadDeadline(time.Now().Add(ReadDeadline))
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			// Return the error so caller (Run) can decide to reconnect/close
-			return err
+			if websocket.IsCloseError(err,
+				websocket.CloseNormalClosure,
+				websocket.CloseGoingAway,
+				websocket.CloseAbnormalClosure) {
+				return fmt.Errorf("connection closed: %w", err)
+			}
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return fmt.Errorf("connection closed")
+			}
+			if strings.Contains(err.Error(), "EOF") {
+				return fmt.Errorf("unexpected EOF - connection dropped by server")
+			}
+			if isTemporaryNetErr(err) {
+				log.Printf("temporary network error, retrying: %v", err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("read error: %w", err)
 		}
 
-		c.rawRead++
+		msgCount++
+		if msgCount == 1 {
+			log.Printf("first message received, data flow started")
+		}
 
-		// Drop detection (non-blocking send)
+		if looksLikeControlMessage(data) {
+			logControlMessage(data)
+			continue
+		}
+
 		select {
-		case c.msgCh <- data:
+		case rawChan <- RawWSMessage{Data: data}:
 		default:
-			c.dropped++ // <---- keep counting drops
+			atomic.AddInt64(&dropCounter, 1)
 		}
 	}
 }
 
-// ------------------------------------------------------------------
-// Worker — now decodes raw → normalized
-// ------------------------------------------------------------------
+func isTemporaryNetErr(err error) bool {
+	if nerr, ok := err.(net.Error); ok {
+		return nerr.Temporary() || nerr.Timeout()
+	}
+	return false
+}
 
-func (c *Collector) worker(ctx context.Context, id int, wg *sync.WaitGroup) {
-	defer wg.Done()
-	log.Printf("worker %d started", id)
+func looksLikeControlMessage(b []byte) bool {
+	return len(b) > 0 && (bytes.Contains(b, []byte(`"result"`)) || bytes.Contains(b, []byte(`"error"`)))
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("worker %d exiting (ctx canceled)", id)
-			// drain remaining messages if any (optional)
+func logControlMessage(b []byte) {
+	var m ControlMsg
+	if err := json.Unmarshal(b, &m); err != nil {
+		log.Printf("control message (unparseable): %s", string(b))
+		return
+	}
+	if m.Error != nil {
+		log.Printf("CONTROL ERROR: code=%d msg=%s", m.Error.Code, m.Error.Msg)
+		return
+	}
+	log.Printf("CONTROL OK: id=%d result=%v", m.ID, m.Result)
+}
+
+func startWorkers(ctx context.Context, rawChan <-chan RawWSMessage, publisher *RedisPublisher, wg *sync.WaitGroup) {
+	WorkerCount := runtime.NumCPU()
+	wg.Add(WorkerCount)
+	for i := 0; i < WorkerCount; i++ {
+		go func(id int) {
+			defer wg.Done()
+			log.Printf("worker %d started", id)
 			for {
 				select {
-				case msg := <-c.msgCh:
-					var raw BinanceBookTicker
-					if err := json.Unmarshal(msg, &raw); err == nil {
-						if normalized, err := NormalizeBinanceBookTicker(raw); err == nil {
-							_ = normalized // placeholder for later publishing
-						}
-					}
-				default:
+				case <-ctx.Done():
+					log.Printf("worker %d exiting (ctx canceled)", id)
 					return
+				case raw, ok := <-rawChan:
+					if !ok {
+						log.Printf("worker %d exiting (channel closed)", id)
+						return
+					}
+					processAndPublish(ctx, raw.Data, publisher)
 				}
 			}
+		}(i)
+	}
+}
 
-		case msg, ok := <-c.msgCh:
-			if !ok {
-				log.Printf("worker %d exiting (channel closed)", id)
-				return
-			}
-			var raw BinanceBookTicker
-			if err := json.Unmarshal(msg, &raw); err != nil {
-				continue
-			}
+func processAndPublish(ctx context.Context, b []byte, publisher *RedisPublisher) {
+	var bt BookTicker
+	if err := json.Unmarshal(b, &bt); err != nil {
+		return
+	}
 
-			normalized, err := NormalizeBinanceBookTicker(raw)
-			if err != nil {
-				continue
-			}
+	// Normalize the data
+	normalized, err := normalizeBookTicker(&bt)
+	if err != nil {
+		log.Printf("normalization error for %s: %v", bt.Symbol, err)
+		return
+	}
 
-			// You will later send normalized to Redis
-			// For now we log it to verify normalization is working
-			log.Printf("normalized: %+v", normalized)
+	// Publish to Redis
+	if err := publisher.Publish(ctx, normalized); err != nil {
+		log.Printf("redis publish error: %v", err)
+	}
+}
 
-			c.processed++
+func normalizeBookTicker(bt *BookTicker) (*NormalizedBookTicker, error) {
+	bidPrice, err := strconv.ParseFloat(bt.BidPrice, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid bid price: %w", err)
+	}
+
+	bidQty, err := strconv.ParseFloat(bt.BidQty, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid bid qty: %w", err)
+	}
+
+	askPrice, err := strconv.ParseFloat(bt.AskPrice, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ask price: %w", err)
+	}
+
+	askQty, err := strconv.ParseFloat(bt.AskQty, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ask qty: %w", err)
+	}
+
+	timestamp := bt.EventTime
+	if timestamp == 0 && bt.TransTs > 0 {
+		timestamp = bt.TransTs
+	}
+
+	return &NormalizedBookTicker{
+		Exchange:      "binance",
+		Symbol:        bt.Symbol,
+		BidPrice:      bidPrice,
+		BidQty:        bidQty,
+		AskPrice:      askPrice,
+		AskQty:        askQty,
+		Timestamp:     timestamp,
+		ReceivedAt:    time.Now().UnixMilli(),
+		OriginalEvent: bt.EventType,
+	}, nil
+}
+
+func monitorQueue(ch chan RawWSMessage) {
+	t := time.NewTicker(QueueWarnEvery)
+	defer t.Stop()
+	for range t.C {
+		n := len(ch)
+		if n > RawBuffer/2 {
+			log.Printf("WARNING: queue usage high: %d/%d", n, RawBuffer)
 		}
 	}
 }
 
-// ------------------------------------------------------------------
-// Run
-// ------------------------------------------------------------------
-
-func (c *Collector) Run(ctx context.Context) error {
-	// Connect (with simple retry)
-	var conn *websocket.Conn
-	var err error
-	for {
-		conn, err = c.connect()
-		if err == nil {
-			break
-		}
-		log.Printf("connect failed: %v (retrying...)", err)
-		time.Sleep(2 * time.Second)
+// symbols fetches symbols from external API
+func symbols() ([]string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("http://152.70.55.44:8080/intersection/futures")
+	if err != nil {
+		return nil, err
 	}
-	log.Println("connected")
+	defer resp.Body.Close()
 
-	// Subscribe
-	if err := c.subscribe(conn); err != nil {
-		conn.Close()
-		return fmt.Errorf("subscribe failed: %w", err)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
-	// Start workers (use WaitGroup so they can be waited on if needed)
-	var wg sync.WaitGroup
-	for i := 0; i < c.workerCount; i++ {
-		wg.Add(1)
-		go c.worker(ctx, i, &wg)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
-	// Run readLoop in a goroutine so we can cancel/close connection on ctx cancel
-	readErrCh := make(chan error, 1)
-	go func() {
-		readErrCh <- c.readLoop(ctx, conn)
-	}()
-
-	// Wait for either read error or context cancellation
-	select {
-	case <-ctx.Done():
-		// context canceled — close connection to unblock ReadMessage
-		log.Println("Run: context canceled, closing websocket connection")
-		conn.Close()
-		// wait for readLoop to return
-		err := <-readErrCh
-		// close message channel to let workers drain and exit
-		close(c.msgCh)
-		// wait for workers
-		wg.Wait()
-		return ctx.ErrOr(err)
-	case err := <-readErrCh:
-		// readLoop returned (error or nil). make sure we close ws and exit.
-		log.Printf("Run: readLoop returned: %v", err)
-		conn.Close()
-		// close msg channel and wait workers
-		close(c.msgCh)
-		wg.Wait()
-		return err
+	var apiResp struct {
+		Symbols []struct {
+			Symbol string `json:"symbol"`
+		} `json:"symbols"`
 	}
-}
-
-// ctx.ErrOr helper: prefer ctx.Err if not nil else return other error (small util)
-func (ctx context.Context) ErrOr(other error) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	return other
-}
-
-// ------------------------------------------------------------------
-
-func main() {
-	symbols := []string{"BTCUSDT", "ETHUSDT", "BNBUSDT"} // example
-
-	c := NewCollector(
-		"wss://stream.binance.com:9443/ws",
-		symbols,
-		8,   // workers (set to runtime.NumCPU() if you prefer)
-		500, // buffer
-	)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		log.Println("shutdown signal received")
-		cancel()
-	}()
-
-	err := c.Run(ctx)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("run error: %v", err)
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return nil, err
 	}
 
-	log.Printf("FINAL STATS: raw=%d processed=%d dropped=%d",
-		c.rawRead, c.processed, c.dropped)
-
-	log.Println("exited")
+	list := make([]string, len(apiResp.Symbols))
+	for i, s := range apiResp.Symbols {
+		list[i] = s.Symbol
+	}
+	return list, nil
 }
