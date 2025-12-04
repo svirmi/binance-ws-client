@@ -25,10 +25,10 @@ import (
 
 const (
 	BinanceWSURL       = "wss://fstream.binance.com/ws"
-	MaxSymbolsPerConn  = 50 // [IMPORTANT] Limit symbols per socket to prevent disconnects
-	BatchSize          = 50 // Batch size for subscribing within a connection
+	MaxSymbolsPerConn  = 40 // [IMPORTANT] Limit symbols per socket to prevent disconnects
+	BatchSize          = 25 // Batch size for subscribing within a connection
 	BatchPause         = 500 * time.Millisecond
-	RawBuffer          = 65000 // buffer for aggregated traffic
+	RawBuffer          = 100000 // buffer for aggregated traffic
 	QueueWarnEvery     = 3 * time.Second
 	ReadDeadline       = 60 * time.Second
 	PingInterval       = 3 * time.Minute
@@ -457,7 +457,7 @@ func looksLikeControlMessage(b []byte) bool {
 }
 
 func startWorkers(ctx context.Context, rawChan <-chan RawWSMessage, publisher *RedisPublisher, wg *sync.WaitGroup) {
-	WorkerCount := runtime.NumCPU() * 4
+	WorkerCount := runtime.NumCPU() * 2
 	wg.Add(WorkerCount)
 	for i := 0; i < WorkerCount; i++ {
 		go func(id int) {
@@ -569,9 +569,25 @@ func symbols() ([]string, error) {
 		return nil, err
 	}
 
-	list := make([]string, len(apiResp.Symbols))
-	for i, s := range apiResp.Symbols {
-		list[i] = s.Symbol
+	// Set of symbols to exclude using an empty struct for memory efficiency
+	excludedSymbols := map[string]struct{}{
+		"ETHUSDT":  {},
+		"SOLUSDT":  {},
+		"BTCUSDT":  {},
+		"XRPUSDT":  {},
+		"BNBUSDT":  {},
+		"DOGEUSDT": {},
+		"LTCUSDT":  {},
+		"ADAUSDT":  {},
 	}
+
+	var list []string
+	for _, s := range apiResp.Symbols {
+		// Check if the symbol exists as a key in the map
+		if _, isExcluded := excludedSymbols[s.Symbol]; !isExcluded {
+			list = append(list, s.Symbol)
+		}
+	}
+
 	return list, nil
 }
