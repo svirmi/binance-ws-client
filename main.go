@@ -355,5 +355,7 @@ func symbols() ([]string, error) {
 	for i, s := range apiResp.Symbols {
 		list[i] = s.Symbol
 	}
+
+	// return []string{"GRIFFAINUSDT", "B2USDT"}, nil
 	return list, nil
 }
