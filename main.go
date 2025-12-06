@@ -43,6 +43,9 @@ const (
 	RedisChannel    = "binance_orderbook"
 	RedisMaxRetries = 3
 	RedisPoolSize   = 10
+
+	// [NEW] Stream key for monitoring data
+	RedisMetricsStream = "monitor:telemetry"
 )
 
 var (
@@ -178,6 +181,16 @@ func (rp *RedisPublisher) Publish(ctx context.Context, data *NormalizedBookTicke
 	return nil
 }
 
+// [NEW] PublishMetrics sends internal telemetry to a Redis Stream
+func (rp *RedisPublisher) PublishMetrics(ctx context.Context, stream string, values map[string]interface{}) error {
+	// XADD appends to the stream. MaxLenApprox keeps the stream size manageable (3600 ~= 1 hour of data)
+	return rp.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		Values: values,
+		MaxLen: 3600,
+	}).Err()
+}
+
 func (rp *RedisPublisher) Close() error {
 	return rp.client.Close()
 }
@@ -201,7 +214,8 @@ func main() {
 	}
 	log.Printf("fetched %d symbols total", len(allSymbols))
 
-	// RANDOMIZE symbol distribution to avoid clustering high-volume pairs (do we really need to do so ???)
+	// RANDOMIZE symbol distribution
+	// rand.Seed is deprecated since Go 1.20, but kept here per previous code style
 	rand.Seed(time.Now().UnixNano())
 	rand.Shuffle(len(allSymbols), func(i, j int) {
 		allSymbols[i], allSymbols[j] = allSymbols[j], allSymbols[i]
@@ -214,6 +228,9 @@ func main() {
 	startWorkers(ctx, rawChan, publisher, &wg)
 	go monitorQueue(rawChan)
 	go printStats()
+
+	// [NEW] Start the metrics streamer
+	go streamMetricsToRedis(ctx, rawChan, publisher)
 
 	// 2. SHARDING LOGIC
 	chunkCount := 0
@@ -261,6 +278,47 @@ func printStats() {
 		log.Printf("STATS: published=%d (%.1f/s) dropped=%d redis_errors=%d",
 			published, float64(rate), dropped, redisErrs)
 		lastPublished = published
+	}
+}
+
+// [NEW] streamMetricsToRedis collects and sends app health data to Redis every second
+func streamMetricsToRedis(ctx context.Context, rawChan chan RawWSMessage, publisher *RedisPublisher) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var lastPub, lastDrop int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			currPub := atomic.LoadInt64(&publishCounter)
+			currDrop := atomic.LoadInt64(&dropCounter)
+			currErr := atomic.LoadInt64(&redisErrCount)
+
+			// Calculate rates (per second)
+			pubRate := currPub - lastPub
+			dropRate := currDrop - lastDrop
+
+			lastPub = currPub
+			lastDrop = currDrop
+
+			metrics := map[string]interface{}{
+				"rate_published": pubRate,
+				"rate_dropped":   dropRate,
+				"total_errors":   currErr,
+				"buffer_len":     len(rawChan),
+				"goroutines":     runtime.NumGoroutine(),
+				"ts":             time.Now().UnixMilli(),
+			}
+
+			if err := publisher.PublishMetrics(ctx, RedisMetricsStream, metrics); err != nil {
+				// Don't crash, just log error locally.
+				// We don't want metric reporting to take down the app.
+				log.Printf("METRICS ERROR: failed to send to redis: %v", err)
+			}
+		}
 	}
 }
 
