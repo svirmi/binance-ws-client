@@ -29,7 +29,7 @@ const (
 	MaxSymbolsPerConn  = 40 // Limit symbols per socket to prevent disconnects
 	BatchSize          = 25 // Batch size for subscribing within a connection
 	BatchPause         = 500 * time.Millisecond
-	RawBuffer          = 100000 // buffer for aggregated traffic
+	RawBuffer          = 110000 // buffer for aggregated traffic
 	QueueWarnEvery     = 3 * time.Second
 	ReadDeadline       = 60 * time.Second
 	PingInterval       = 3 * time.Minute
@@ -474,7 +474,7 @@ func looksLikeControlMessage(b []byte) bool {
 }
 
 func startWorkers(ctx context.Context, rawChan <-chan RawWSMessage, publisher *RedisPublisher, wg *sync.WaitGroup) {
-	WorkerCount := runtime.NumCPU() * 4
+	WorkerCount := runtime.NumCPU() * 6
 	wg.Add(WorkerCount)
 
 	for i := 0; i < WorkerCount; i++ {
