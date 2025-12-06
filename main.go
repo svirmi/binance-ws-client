@@ -566,6 +566,7 @@ func processAndPublish(ctx context.Context, b []byte, publisher *RedisPublisher)
 
 	if err := publisher.Publish(ctx, normalized); err != nil {
 		// Suppress log noise, rely on stats
+		log.Printf("Redis publisher error: %s", err)
 	}
 }
 
