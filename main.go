@@ -600,6 +600,8 @@ func symbols() ([]string, error) {
 		"ADAUSDT":  {},
 		"ATOMUSDT": {},
 		"SUIUSDT":  {},
+		"HYPEUSDT": {},
+		"LINKUSDT": {},
 	}
 
 	var list []string
